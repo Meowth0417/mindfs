@@ -1,0 +1,72 @@
+{
+  "relayBaseURL": "https://relay.a9gent.com",
+  "agents": [
+    {
+      "name": "gemini",
+      "command": "gemini",
+      "args": ["--experimental-acp"]
+    },
+    {
+      "name": "codex",
+      "command": "codex"
+    },
+    {
+      "name": "claude",
+      "command": "claude"
+    },
+    {
+      "name": "cursor",
+      "command": "agent",
+      "args": ["acp"]
+    },
+    {
+      "name": "augment",
+      "command": "auggie",
+      "args": ["--acp"]
+    },
+    {
+      "name": "cline",
+      "command": "cline",
+      "args": ["--acp"]
+    },
+    {
+      "name": "copilot",
+      "command": "copilot",
+      "args": ["--acp"]
+    },
+    {
+      "name": "kimi",
+      "command": "kimi",
+      "args": ["acp"]
+    },
+    {
+      "name": "kiro",
+      "command": "kiro-cli",
+      "args": ["acp"]
+    },
+    {
+      "name": "openclaw",
+      "command": "openclaw",
+      "args": ["acp"]
+    },
+    {
+      "name": "opencode",
+      "command": "opencode",
+      "args": ["acp"]
+    },
+    {
+      "name": "qwen",
+      "command": "qwen",
+      "args": ["--acp"]
+    },
+    {
+      "name": "qoder",
+      "command": "qodercli",
+      "args": ["--acp"]
+    },
+    {
+      "name": "pi",
+      "command": "pi-acp"
+    }
+  ]
+}
