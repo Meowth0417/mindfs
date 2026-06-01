@@ -41,6 +41,7 @@ type AppContext struct {
 	fileChangeBatchListeners []func(fs.FileChangeBatchEvent)
 	relatedFileListeners     []func(fs.RelatedFileEvent)
 	streamHub                *StreamHub
+	environmentCommandRunner *usecase.EnvironmentCommandRunner
 	candidateRegistry        *usecase.CandidateRegistry
 	externalImporters        map[string]agenttypes.ExternalSessionImporter
 }
@@ -311,6 +312,15 @@ func (s *AppContext) GetSessionStreamHub() *StreamHub {
 		s.streamHub = NewStreamHub(s.E2EE)
 	}
 	return s.streamHub
+}
+
+func (s *AppContext) GetEnvironmentCommandRunner() *usecase.EnvironmentCommandRunner {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.environmentCommandRunner == nil {
+		s.environmentCommandRunner = usecase.NewEnvironmentCommandRunner()
+	}
+	return s.environmentCommandRunner
 }
 
 func (s *AppContext) GetCandidateRegistry() *usecase.CandidateRegistry {

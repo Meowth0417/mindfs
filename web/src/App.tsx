@@ -38,9 +38,18 @@ import {
 } from "./services/file";
 import {
   canLaunchVSCode,
+  type ExternalLaunchAction,
   launchVSCode,
   openVSCodeProtocol,
 } from "./services/vscode";
+import {
+  fetchEnvironmentCommands,
+  runEnvironmentCommand,
+  saveEnvironmentCommand,
+  type EnvironmentCommand,
+  type EnvironmentCommandIcon,
+  type EnvironmentCommandRunStatus,
+} from "./services/environmentCommands";
 import {
   buildGitDiffCacheSignature,
   checkoutGitBranch,
@@ -109,9 +118,7 @@ import { fetchAgents, type AgentStatus } from "./services/agents";
 // 类型定义
 type SessionMode = "chat" | "plugin";
 
-function normalizeFastService(
-  value: unknown,
-): "" | "on" | "off" {
+function normalizeFastService(value: unknown): "" | "on" | "off" {
   return value === "on" || value === "off" ? value : "";
 }
 
@@ -157,6 +164,35 @@ export type SessionItem = {
   pending?: boolean;
 };
 
+type CommandFormState = {
+  name: string;
+  icon: EnvironmentCommandIcon;
+  command: string;
+  setDefault: boolean;
+};
+
+type EnvironmentCommandOutputChunk = {
+  id: string;
+  stream: "stdout" | "stderr";
+  text: string;
+};
+
+type EnvironmentCommandRunState = {
+  rootId: string;
+  runId: string;
+  commandId: string;
+  name: string;
+  command: string;
+  target: string;
+  status: EnvironmentCommandRunStatus;
+  startedAt?: string;
+  finishedAt?: string;
+  exitCode?: number;
+  error?: string;
+  chunks: EnvironmentCommandOutputChunk[];
+  expanded: boolean;
+};
+
 function latestExchangeText(
   exchanges: unknown,
   field: "agent" | "mode" | "effort" | "fast_service",
@@ -173,6 +209,89 @@ function latestExchangeText(
   return "";
 }
 
+function latestExchangeContextWindow(
+  exchanges: unknown,
+): { totalTokens: number; modelContextWindow: number } | undefined {
+  if (!Array.isArray(exchanges)) {
+    return undefined;
+  }
+  for (let i = exchanges.length - 1; i >= 0; i -= 1) {
+    const candidate = (exchanges[i] as Record<string, unknown> | null)
+      ?.context_window as Record<string, unknown> | undefined;
+    const totalTokens = Math.max(0, Number(candidate?.totalTokens || 0));
+    const modelContextWindow = Math.max(
+      0,
+      Number(candidate?.modelContextWindow || 0),
+    );
+    if (totalTokens > 0 && modelContextWindow > 0) {
+      return { totalTokens, modelContextWindow };
+    }
+  }
+  return undefined;
+}
+
+function getDefaultEnvironmentCommand(
+  commands: EnvironmentCommand[],
+): EnvironmentCommand | null {
+  if (!Array.isArray(commands) || commands.length === 0) {
+    return null;
+  }
+  return commands.find((item) => item.is_default) || commands[0] || null;
+}
+
+function markDefaultEnvironmentCommand(
+  commands: EnvironmentCommand[],
+  commandId: string,
+): EnvironmentCommand[] {
+  let matched = false;
+  const next = commands.map((item) => {
+    const isDefault = item.id === commandId;
+    if (isDefault) {
+      matched = true;
+    }
+    return { ...item, is_default: isDefault };
+  });
+  if (!matched && next.length > 0) {
+    next[0] = { ...next[0], is_default: true };
+  }
+  return next;
+}
+
+function stripAnsiEscapeSequences(text: string): string {
+  return text.replace(
+    // Matches CSI/OSC ANSI escape sequences so streamed terminal text renders cleanly in the web UI.
+    /\u001B(?:\][^\u0007\u001B]*(?:\u0007|\u001B\\)|\[[0-?]*[ -/]*[@-~]|[@-Z\\-_])/g,
+    "",
+  );
+}
+
+function environmentCommandStatusLabel(
+  status: EnvironmentCommandRunStatus,
+  exitCode?: number,
+): string {
+  switch (status) {
+    case "completed":
+      return typeof exitCode === "number" ? `已完成 · ${exitCode}` : "已完成";
+    case "failed":
+      return typeof exitCode === "number" ? `失败 · ${exitCode}` : "失败";
+    default:
+      return "运行中";
+  }
+}
+
+function environmentCommandStatusColor(
+  status: EnvironmentCommandRunStatus,
+): string {
+  switch (status) {
+    case "completed":
+      return "#16a34a";
+    case "failed":
+      return "#dc2626";
+    default:
+      return "#2563eb";
+  }
+}
+
 function toSessionItem(
   rootID: string | null | undefined,
   session: any,
@@ -186,6 +305,15 @@ function toSessionItem(
   if (!key || !nextRoot) {
     return null;
   }
+  const contextWindow =
+    session?.context_window &&
+    Number(session.context_window.totalTokens) > 0 &&
+    Number(session.context_window.modelContextWindow) > 0
+      ? {
+          totalTokens: Number(session.context_window.totalTokens),
+          modelContextWindow: Number(session.context_window.modelContextWindow),
+        }
+      : latestExchangeContextWindow(session?.exchanges);
   return {
     key,
     session_key: key,
@@ -210,7 +338,9 @@ function toSessionItem(
         : latestExchangeText(session?.exchanges, "effort"),
     fast_service:
       normalizeFastService(session?.fast_service) ||
-      normalizeFastService(latestExchangeText(session?.exchanges, "fast_service")),
+      normalizeFastService(
+        latestExchangeText(session?.exchanges, "fast_service"),
+      ),
     scope: typeof session?.scope === "string" ? session.scope : "",
     purpose: typeof session?.purpose === "string" ? session.purpose : "",
     created_at:
@@ -219,15 +349,7 @@ function toSessionItem(
       typeof session?.updated_at === "string" ? session.updated_at : undefined,
     closed_at:
       typeof session?.closed_at === "string" ? session.closed_at : undefined,
-    context_window:
-      session?.context_window &&
-      Number(session.context_window.totalTokens) > 0 &&
-      Number(session.context_window.modelContextWindow) > 0
-        ? {
-            totalTokens: Number(session.context_window.totalTokens),
-            modelContextWindow: Number(session.context_window.modelContextWindow),
-          }
-        : undefined,
+    context_window: contextWindow,
     search_seq:
       typeof session?.search_seq === "number" ? session.search_seq : undefined,
     search_snippet:
@@ -240,7 +362,14 @@ function toSessionItem(
       session?.search_match_type === "reply"
         ? session.search_match_type
         : undefined,
-    pending: typeof session?.pending === "boolean" ? session.pending : undefined,
+    related_files: Array.isArray(session?.related_files)
+      ? (session.related_files as RelatedFile[])
+      : undefined,
+    exchanges: Array.isArray(session?.exchanges)
+      ? (session.exchanges as SessionItem["exchanges"])
+      : undefined,
+    pending:
+      typeof session?.pending === "boolean" ? session.pending : undefined,
   };
 }
 type Exchange = {
@@ -331,10 +460,1208 @@ function VSCodeIcon({ size = 16 }: { size?: number }) {
       fill="#007ACC"
       aria-hidden="true"
     >
+      <path d="M15.434 1.72887L12.14 0.144875C12.002 0.078875 11.855 0.046875 11.709 0.046875C11.353 0.046875 11.18 0.211875 11.155 0.228875C11.073 0.270875 11.005 0.337875 11.004 0.338875L4.698 6.08888L1.951 4.00488C1.832 3.91388 1.69 3.86987 1.548 3.86987C1.387 3.86987 1.226 3.92788 1.1 4.04288L0.219 4.84387C0.074 4.97587 0.001 5.15688 0.001 5.33687C0.001 5.51687 0.073 5.69688 0.218 5.82888L2.6 8.00088L0.217 10.1719C0.072 10.3039 0 10.4839 0 10.6639C0 10.8439 0.073 11.0249 0.218 11.1569L1.099 11.9579C1.226 12.0729 1.386 12.1309 1.547 12.1309C1.688 12.1309 1.83 12.0859 1.95 11.9959L4.697 9.91187L11.003 15.6619C11.003 15.6619 11.072 15.7299 11.155 15.7719C11.179 15.7889 11.353 15.9529 11.709 15.9529C11.855 15.9529 12.003 15.9209 12.141 15.8549L15.435 14.2709C15.781 14.1049 16.001 13.7539 16.001 13.3699V2.62888C16.001 2.24487 15.781 1.89488 15.435 1.72787L15.434 1.72887ZM7.217 7.99988L12.002 4.36987V11.6299L7.217 7.99988Z" />
+    </svg>
+  );
+}
+
+function FolderOpenIcon({ size = 15 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 16 16"
+      fill="none"
+      aria-hidden="true"
+    >
       <path
-        d="M15.434 1.72887L12.14 0.144875C12.002 0.078875 11.855 0.046875 11.709 0.046875C11.353 0.046875 11.18 0.211875 11.155 0.228875C11.073 0.270875 11.005 0.337875 11.004 0.338875L4.698 6.08888L1.951 4.00488C1.832 3.91388 1.69 3.86987 1.548 3.86987C1.387 3.86987 1.226 3.92788 1.1 4.04288L0.219 4.84387C0.074 4.97587 0.001 5.15688 0.001 5.33687C0.001 5.51687 0.073 5.69688 0.218 5.82888L2.6 8.00088L0.217 10.1719C0.072 10.3039 0 10.4839 0 10.6639C0 10.8439 0.073 11.0249 0.218 11.1569L1.099 11.9579C1.226 12.0729 1.386 12.1309 1.547 12.1309C1.688 12.1309 1.83 12.0859 1.95 11.9959L4.697 9.91187L11.003 15.6619C11.003 15.6619 11.072 15.7299 11.155 15.7719C11.179 15.7889 11.353 15.9529 11.709 15.9529C11.855 15.9529 12.003 15.9209 12.141 15.8549L15.435 14.2709C15.781 14.1049 16.001 13.7539 16.001 13.3699V2.62888C16.001 2.24487 15.781 1.89488 15.435 1.72787L15.434 1.72887ZM7.217 7.99988L12.002 4.36987V11.6299L7.217 7.99988Z"
+        fill="#FFE08A"
+        d="M1.5 4.5A1.5 1.5 0 0 1 3 3h2.75c.45 0 .88.18 1.2.5l.8.8c.19.19.44.3.7.3H13A1.5 1.5 0 0 1 14.5 6v1.25H1.5z"
+      />
+      <path
+        fill="#F4C84A"
+        d="M1.5 6.75h13v4.75A1.5 1.5 0 0 1 13 13H3a1.5 1.5 0 0 1-1.5-1.5z"
+      />
+      <path
+        fill="#2B7CD3"
+        d="M8.2 8.1h4.7c.33 0 .6.27.6.6v1.6a.6.6 0 0 1-.6.6H8.2a.6.6 0 0 1-.6-.6V8.7c0-.33.27-.6.6-.6Z"
+      />
+      <path
+        fill="#8FD3FF"
+        d="M8.35 8.55h4.4c.17 0 .3.13.3.3v.35h-5v-.35c0-.17.13-.3.3-.3Z"
       />
     </svg>
+  );
+}
+
+function PowerShellIcon({ size = 15 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 16 16"
+      fill="none"
+      aria-hidden="true"
+    >
+      <rect x="1.5" y="2" width="13" height="12" rx="2.2" fill="#2B7CD3" />
+      <path
+        fill="#7CCBFF"
+        d="M3.1 4.2a1.2 1.2 0 0 1 1.2-1.2h8.6A1.6 1.6 0 0 1 14.5 4.6v.6H3.1z"
+      />
+      <path
+        fill="#FFFFFF"
+        d="M4.55 5.35a.6.6 0 0 1 .85 0L7.55 7.5a.6.6 0 0 1 0 .85L5.4 10.5a.6.6 0 1 1-.85-.85l1.73-1.73-1.73-1.72a.6.6 0 0 1 0-.85Zm4.1 4.4h2.8a.55.55 0 1 1 0 1.1h-2.8a.55.55 0 1 1 0-1.1Z"
+      />
+    </svg>
+  );
+}
+
+function InlineTerminalIcon({ size = 15 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 16 16"
+      fill="none"
+      aria-hidden="true"
+    >
+      <rect
+        x="1.5"
+        y="2"
+        width="13"
+        height="12"
+        rx="2.2"
+        stroke="currentColor"
+        strokeWidth="1.2"
+      />
+      <path
+        d="m4.7 5.4 2 2.1-2 2.1"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M8.35 10.1h3"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+function CommandRunIcon({ size = 15 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <circle cx="8" cy="8" r="7" fill="#22C55E" />
+      <path d="M6 4.9 11 8l-5 3.1Z" fill="#F0FDF4" />
+    </svg>
+  );
+}
+
+function CommandToolIcon({ size = 15 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <circle cx="8" cy="8" r="7" fill="#3B82F6" />
+      <path
+        fill="#EFF6FF"
+        d="M9.85 3.9a2.52 2.52 0 0 0-1.9 3.96L5.22 10.6a1.03 1.03 0 1 0 1.46 1.46l2.74-2.73a2.52 2.52 0 0 0 2.58-4.16l-1.36 1.37-.98-.17-.18-.99L9.85 3.9Z"
+      />
+    </svg>
+  );
+}
+
+function CommandTestIcon({ size = 15 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <circle cx="8" cy="8" r="7" fill="#F59E0B" />
+      <path
+        fill="#FFFBEB"
+        d="M6.15 3.7a.55.55 0 0 1 .55.55v1.8L9.9 10.7a1.55 1.55 0 0 1-1.27 2.45H7.37A1.55 1.55 0 0 1 6.1 10.7l3.2-4.65v-1.8a.55.55 0 1 1 1.1 0v1.97c0 .11-.03.22-.1.31L7 11.02a.45.45 0 0 0 .37.73h1.26a.45.45 0 0 0 .37-.73L5.8 6.53a.55.55 0 0 1-.1-.31V4.25a.55.55 0 0 1 .55-.55Z"
+      />
+    </svg>
+  );
+}
+
+function CommandOtherIcon({ size = 15 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <circle cx="8" cy="8" r="7" fill="#64748B" />
+      <circle cx="5" cy="8" r="1" fill="#F8FAFC" />
+      <circle cx="8" cy="8" r="1" fill="#F8FAFC" />
+      <circle cx="11" cy="8" r="1" fill="#F8FAFC" />
+    </svg>
+  );
+}
+
+function AddActionIcon({ size = 15 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <circle cx="8" cy="8" r="7" fill="#E2E8F0" />
+      <path
+        d="M8 4.5v7M4.5 8h7"
+        stroke="#334155"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+function EnvironmentCommandIconGlyph({
+  icon,
+  size = 15,
+}: {
+  icon?: EnvironmentCommandIcon;
+  size?: number;
+}) {
+  switch (icon) {
+    case "run":
+      return <CommandRunIcon size={size} />;
+    case "tool":
+      return <CommandToolIcon size={size} />;
+    case "test":
+      return <CommandTestIcon size={size} />;
+    default:
+      return <CommandOtherIcon size={size} />;
+  }
+}
+
+type CommandLauncherButtonProps = {
+  disabled?: boolean;
+  busy?: boolean;
+  variant?: "subtle" | "panel";
+  commands: EnvironmentCommand[];
+  onRunCommand: (
+    command: EnvironmentCommand,
+    options?: { makeDefault?: boolean },
+  ) => void | Promise<void>;
+  onAddCommand: () => void;
+};
+
+function CommandLauncherButton({
+  disabled = false,
+  busy = false,
+  variant = "subtle",
+  commands,
+  onRunCommand,
+  onAddCommand,
+}: CommandLauncherButtonProps) {
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [mainHovered, setMainHovered] = useState(false);
+  const [toggleHovered, setToggleHovered] = useState(false);
+  const isPanel = variant === "panel";
+  const mainDisabled = disabled || busy;
+  const defaultCommand = getDefaultEnvironmentCommand(commands);
+
+  useEffect(() => {
+    if (!menuOpen) {
+      return;
+    }
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!menuRef.current?.contains(event.target as Node)) {
+        setMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => document.removeEventListener("mousedown", handlePointerDown);
+  }, [menuOpen]);
+
+  return (
+    <div
+      ref={menuRef}
+      style={{
+        position: "relative",
+        display: "inline-flex",
+        alignItems: "center",
+        flexShrink: 0,
+        pointerEvents: "auto",
+        border: "1px solid var(--border-color)",
+        borderRadius: "8px",
+        background: isPanel ? "var(--content-bg)" : "transparent",
+        overflow: "visible",
+      }}
+    >
+      <button
+        type="button"
+        onClick={() => {
+          if (mainDisabled) {
+            return;
+          }
+          if (defaultCommand) {
+            void onRunCommand(defaultCommand);
+            return;
+          }
+          onAddCommand();
+        }}
+        onMouseEnter={() => setMainHovered(true)}
+        onMouseLeave={() => setMainHovered(false)}
+        disabled={mainDisabled}
+        title={defaultCommand ? `运行：${defaultCommand.name}` : "添加操作命令"}
+        aria-label={defaultCommand ? `运行：${defaultCommand.name}` : "添加操作命令"}
+        style={{
+          width: isPanel ? "32px" : "28px",
+          height: isPanel ? "32px" : "28px",
+          borderRadius: "8px 0 0 8px",
+          border: "none",
+          background: mainHovered ? "rgba(0, 0, 0, 0.08)" : "transparent",
+          color: "var(--text-secondary)",
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          cursor: mainDisabled ? "not-allowed" : "pointer",
+          opacity: mainDisabled ? 0.5 : 1,
+          outline: "none",
+          padding: 0,
+        }}
+      >
+        {defaultCommand ? (
+          <EnvironmentCommandIconGlyph icon={defaultCommand.icon} />
+        ) : (
+          <AddActionIcon />
+        )}
+      </button>
+      <button
+        type="button"
+        onClick={() => {
+          if (!mainDisabled) {
+            setMenuOpen((open) => !open);
+          }
+        }}
+        onMouseEnter={() => setToggleHovered(true)}
+        onMouseLeave={() => setToggleHovered(false)}
+        disabled={mainDisabled}
+        aria-label="切换操作命令"
+        aria-haspopup="menu"
+        aria-expanded={menuOpen}
+        style={{
+          width: isPanel ? "20px" : "18px",
+          height: isPanel ? "32px" : "28px",
+          border: "none",
+          borderRadius: "0 8px 8px 0",
+          background:
+            menuOpen || toggleHovered ? "rgba(0, 0, 0, 0.08)" : "transparent",
+          color: "var(--text-secondary)",
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          cursor: mainDisabled ? "not-allowed" : "pointer",
+          opacity: mainDisabled ? 0.5 : 1,
+          outline: "none",
+          padding: 0,
+        }}
+      >
+        <ChevronDownSmallIcon />
+      </button>
+      {menuOpen ? (
+        <div
+          role="menu"
+          style={{
+            position: "absolute",
+            top: "calc(100% + 6px)",
+            right: 0,
+            minWidth: "250px",
+            padding: "6px",
+            borderRadius: "10px",
+            border: "1px solid var(--border-color)",
+            background: "var(--menu-bg)",
+            boxShadow: "0 12px 30px rgba(15, 23, 42, 0.14)",
+            zIndex: 40,
+            display: "flex",
+            flexDirection: "column",
+            gap: "2px",
+          }}
+        >
+          {commands.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setMenuOpen(false);
+                void onRunCommand(item, { makeDefault: true });
+              }}
+              style={{
+                width: "100%",
+                border: "none",
+                background: "transparent",
+                color: "var(--text-primary)",
+                borderRadius: "8px",
+                padding: "9px 10px",
+                display: "flex",
+                alignItems: "flex-start",
+                gap: "8px",
+                textAlign: "left",
+                cursor: "pointer",
+                fontSize: "12px",
+              }}
+            >
+              <span
+                style={{
+                  width: "16px",
+                  height: "16px",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  flexShrink: 0,
+                  marginTop: "1px",
+                }}
+              >
+                <EnvironmentCommandIconGlyph icon={item.icon} size={14} />
+              </span>
+              <span
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "2px",
+                  minWidth: 0,
+                  flex: 1,
+                }}
+              >
+                <span
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    minWidth: 0,
+                  }}
+                >
+                  <span
+                    style={{
+                      fontWeight: 600,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {item.name}
+                  </span>
+                  {item.is_default ? (
+                    <span
+                      style={{
+                        fontSize: "10px",
+                        color: "var(--text-secondary)",
+                        border: "1px solid var(--border-color)",
+                        borderRadius: "999px",
+                        padding: "0 6px",
+                        lineHeight: "16px",
+                        flexShrink: 0,
+                      }}
+                    >
+                      默认
+                    </span>
+                  ) : null}
+                </span>
+                <span
+                  style={{
+                    fontSize: "11px",
+                    color: "var(--text-secondary)",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {item.command}
+                </span>
+              </span>
+            </button>
+          ))}
+          {commands.length > 0 ? (
+            <div
+              style={{
+                height: "1px",
+                background: "var(--border-color)",
+                margin: "4px 6px",
+              }}
+            />
+          ) : (
+            <div
+              style={{
+                padding: "10px 12px 6px",
+                fontSize: "11px",
+                color: "var(--text-secondary)",
+              }}
+            >
+              还没有操作命令
+            </div>
+          )}
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setMenuOpen(false);
+              onAddCommand();
+            }}
+            style={{
+              width: "100%",
+              border: "none",
+              background: "transparent",
+              color: "var(--text-primary)",
+              borderRadius: "8px",
+              padding: "9px 10px",
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+              textAlign: "left",
+              cursor: "pointer",
+              fontSize: "12px",
+            }}
+          >
+            <span
+              style={{
+                width: "16px",
+                height: "16px",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                flexShrink: 0,
+              }}
+            >
+              <AddActionIcon size={14} />
+            </span>
+            <span>添加操作</span>
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+type ExternalLauncherButtonProps = {
+  disabled?: boolean;
+  busy?: boolean;
+  hasFileTarget?: boolean;
+  variant?: "subtle" | "panel";
+  onLaunch: (action: ExternalLaunchAction) => void | Promise<void>;
+};
+
+function ExternalLauncherButton({
+  disabled = false,
+  busy = false,
+  hasFileTarget = false,
+  variant = "subtle",
+  onLaunch,
+}: ExternalLauncherButtonProps) {
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [mainHovered, setMainHovered] = useState(false);
+  const [toggleHovered, setToggleHovered] = useState(false);
+  const isPanel = variant === "panel";
+  const mainDisabled = disabled || busy;
+
+  useEffect(() => {
+    if (!menuOpen) {
+      return;
+    }
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!menuRef.current?.contains(event.target as Node)) {
+        setMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => document.removeEventListener("mousedown", handlePointerDown);
+  }, [menuOpen]);
+
+  const launchOptions: Array<{
+    action: ExternalLaunchAction;
+    label: string;
+    icon: React.ReactNode;
+  }> = [
+    {
+      action: "vscode",
+      label: "VS Code",
+      icon: <VSCodeIcon size={14} />,
+    },
+    {
+      action: "explorer",
+      label: "资源管理器",
+      icon: <FolderOpenIcon size={14} />,
+    },
+    {
+      action: "powershell",
+      label: "PowerShell",
+      icon: <PowerShellIcon size={14} />,
+    },
+  ];
+
+  return (
+    <div
+      ref={menuRef}
+      style={{
+        position: "relative",
+        display: "inline-flex",
+        alignItems: "center",
+        flexShrink: 0,
+        pointerEvents: "auto",
+        border: "1px solid var(--border-color)",
+        borderRadius: "8px",
+        background: isPanel ? "var(--content-bg)" : "transparent",
+        overflow: "visible",
+      }}
+    >
+      <button
+        type="button"
+        onClick={() => {
+          void onLaunch("vscode");
+        }}
+        onMouseEnter={() => setMainHovered(true)}
+        onMouseLeave={() => setMainHovered(false)}
+        disabled={mainDisabled}
+        title={hasFileTarget ? "在 VS Code 中打开" : "在 VS Code 中打开"}
+        aria-label={hasFileTarget ? "在 VS Code 中打开" : "在 VS Code 中打开"}
+        style={{
+          width: isPanel ? "32px" : "28px",
+          height: isPanel ? "32px" : "28px",
+          borderRadius: "8px 0 0 8px",
+          border: "none",
+          background: mainHovered ? "rgba(0, 0, 0, 0.08)" : "transparent",
+          color: "var(--text-secondary)",
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          cursor: mainDisabled ? "not-allowed" : "pointer",
+          opacity: mainDisabled ? 0.5 : 1,
+          outline: "none",
+          padding: 0,
+        }}
+      >
+        <VSCodeIcon />
+      </button>
+      <button
+        type="button"
+        onClick={() => {
+          if (!mainDisabled) {
+            setMenuOpen((open) => !open);
+          }
+        }}
+        onMouseEnter={() => setToggleHovered(true)}
+        onMouseLeave={() => setToggleHovered(false)}
+        disabled={mainDisabled}
+        aria-label="切换外部打开方式"
+        aria-haspopup="menu"
+        aria-expanded={menuOpen}
+        style={{
+          width: isPanel ? "20px" : "18px",
+          height: isPanel ? "32px" : "28px",
+          border: "none",
+          borderRadius: "0 8px 8px 0",
+          background:
+            menuOpen || toggleHovered ? "rgba(0, 0, 0, 0.08)" : "transparent",
+          color: "var(--text-secondary)",
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          cursor: mainDisabled ? "not-allowed" : "pointer",
+          opacity: mainDisabled ? 0.5 : 1,
+          outline: "none",
+          padding: 0,
+        }}
+      >
+        <ChevronDownSmallIcon />
+      </button>
+      {menuOpen ? (
+        <div
+          role="menu"
+          style={{
+            position: "absolute",
+            top: "calc(100% + 6px)",
+            right: 0,
+            minWidth: "132px",
+            padding: "6px",
+            borderRadius: "10px",
+            border: "1px solid var(--border-color)",
+            background: "var(--menu-bg)",
+            boxShadow: "0 12px 30px rgba(15, 23, 42, 0.14)",
+            zIndex: 40,
+            display: "flex",
+            flexDirection: "column",
+            gap: "2px",
+          }}
+        >
+          {launchOptions.map((item) => (
+            <button
+              key={item.action}
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setMenuOpen(false);
+                void onLaunch(item.action);
+              }}
+              style={{
+                width: "100%",
+                border: "none",
+                background: "transparent",
+                color: "var(--text-primary)",
+                borderRadius: "8px",
+                padding: "9px 10px",
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+                textAlign: "left",
+                cursor: "pointer",
+                fontSize: "12px",
+              }}
+            >
+              <span
+                style={{
+                  width: "16px",
+                  height: "16px",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  flexShrink: 0,
+                }}
+              >
+                {item.icon}
+              </span>
+              <span>{item.label}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+type EnvironmentCommandTerminalPanelProps = {
+  run: EnvironmentCommandRunState | null;
+  onToggleExpanded: () => void;
+  onClear: () => void;
+};
+
+function EnvironmentCommandTerminalPanel({
+  run,
+  onToggleExpanded,
+  onClear,
+}: EnvironmentCommandTerminalPanelProps) {
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!run?.expanded || !bodyRef.current) {
+      return;
+    }
+    bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
+  }, [run?.expanded, run?.chunks.length, run?.status]);
+
+  if (!run) {
+    return null;
+  }
+
+  const statusColor = environmentCommandStatusColor(run.status);
+  const statusLabel = environmentCommandStatusLabel(run.status, run.exitCode);
+
+  return (
+    <div
+      style={{
+        flexShrink: 0,
+        borderTop: "1px solid var(--border-color)",
+        background: "var(--content-bg)",
+        display: "flex",
+        flexDirection: "column",
+        minHeight: 0,
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: "12px",
+          padding: "10px 14px",
+          minHeight: "48px",
+        }}
+      >
+        <button
+          type="button"
+          onClick={onToggleExpanded}
+          aria-label={run.expanded ? "收起终端" : "展开终端"}
+          style={{
+            width: "24px",
+            height: "24px",
+            border: "none",
+            borderRadius: "6px",
+            background: "transparent",
+            color: "var(--text-secondary)",
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            cursor: "pointer",
+            padding: 0,
+            flexShrink: 0,
+          }}
+        >
+          <svg
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            style={{
+              transform: run.expanded ? "rotate(0deg)" : "rotate(-90deg)",
+              transition: "transform 0.15s ease",
+            }}
+          >
+            <path d="m6 9 6 6 6-6" />
+          </svg>
+        </button>
+        <div
+          style={{
+            minWidth: 0,
+            flex: 1,
+            display: "flex",
+            flexDirection: "column",
+            gap: "2px",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+              minWidth: 0,
+              flexWrap: "wrap",
+            }}
+          >
+            <span style={{ fontSize: "13px", fontWeight: 700, color: "var(--text-primary)" }}>
+              终端
+            </span>
+            <span
+              style={{
+                fontSize: "11px",
+                color: statusColor,
+                border: `1px solid ${statusColor}33`,
+                background: `${statusColor}14`,
+                borderRadius: "999px",
+                padding: "1px 8px",
+                lineHeight: "18px",
+                fontWeight: 600,
+              }}
+            >
+              {statusLabel}
+            </span>
+            <span
+              style={{
+                fontSize: "12px",
+                color: "var(--text-primary)",
+                fontWeight: 600,
+                minWidth: 0,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+              title={run.name}
+            >
+              {run.name}
+            </span>
+          </div>
+          <div
+            style={{
+              fontSize: "11px",
+              color: "var(--text-secondary)",
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              fontFamily:
+                "ui-monospace, SFMono-Regular, SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace",
+            }}
+            title={`${run.target}> ${run.command}`}
+          >
+            {run.target}
+            {" > "}
+            {run.command}
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={onClear}
+          style={{
+            border: "1px solid var(--border-color)",
+            background: "transparent",
+            color: "var(--text-secondary)",
+            borderRadius: "8px",
+            padding: "6px 10px",
+            fontSize: "12px",
+            cursor: "pointer",
+            flexShrink: 0,
+          }}
+        >
+          清空
+        </button>
+      </div>
+      {run.expanded ? (
+        <div
+          ref={bodyRef}
+          style={{
+            minHeight: "160px",
+            maxHeight: "240px",
+            overflow: "auto",
+            padding: "0 14px 14px",
+          }}
+        >
+          <div
+            style={{
+              borderRadius: "12px",
+              border: "1px solid rgba(148, 163, 184, 0.32)",
+              background: "#ffffff",
+              color: "#0f172a",
+              padding: "12px 14px",
+              fontSize: "12px",
+              lineHeight: 1.6,
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+              boxShadow: "inset 0 1px 0 rgba(255,255,255,0.7)",
+              fontFamily:
+                "ui-monospace, SFMono-Regular, SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace",
+            }}
+          >
+            {run.chunks.length > 0 ? (
+              run.chunks.map((chunk) => (
+                <span
+                  key={chunk.id}
+                  style={{
+                    color: chunk.stream === "stderr" ? "#dc2626" : "#0f172a",
+                  }}
+                >
+                  {stripAnsiEscapeSequences(chunk.text)}
+                </span>
+              ))
+            ) : (
+              <span style={{ color: "#64748b" }}>
+                {run.status === "running" ? "等待命令输出..." : "暂无输出"}
+              </span>
+            )}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+type InlineTerminalButtonProps = {
+  disabled?: boolean;
+  active?: boolean;
+  variant?: "subtle" | "panel";
+  onClick: () => void;
+};
+
+function InlineTerminalButton({
+  disabled = false,
+  active = false,
+  variant = "subtle",
+  onClick,
+}: InlineTerminalButtonProps) {
+  const [hovered, setHovered] = useState(false);
+  const isPanel = variant === "panel";
+
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        if (!disabled) {
+          onClick();
+        }
+      }}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      disabled={disabled}
+      title={disabled ? "暂无页内终端" : "唤起页内终端"}
+      aria-label={disabled ? "暂无页内终端" : "唤起页内终端"}
+      style={{
+        width: isPanel ? "32px" : "28px",
+        height: isPanel ? "32px" : "28px",
+        borderRadius: "8px",
+        border: "1px solid var(--border-color)",
+        background: active
+          ? "rgba(37, 99, 235, 0.12)"
+          : hovered
+            ? "rgba(0, 0, 0, 0.08)"
+            : "transparent",
+        color: active ? "#2563eb" : "var(--text-secondary)",
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        cursor: disabled ? "not-allowed" : "pointer",
+        opacity: disabled ? 0.5 : 1,
+        outline: "none",
+        padding: 0,
+        flexShrink: 0,
+      }}
+    >
+      <InlineTerminalIcon />
+    </button>
+  );
+}
+
+type CommandDialogProps = {
+  open: boolean;
+  busy?: boolean;
+  error?: string;
+  value: CommandFormState;
+  onChange: (next: CommandFormState) => void;
+  onClose: () => void;
+  onSubmit: () => void | Promise<void>;
+};
+
+function AddCommandDialog({
+  open,
+  busy = false,
+  error = "",
+  value,
+  onChange,
+  onClose,
+  onSubmit,
+}: CommandDialogProps) {
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busy) {
+        onClose();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [busy, onClose, open]);
+
+  if (!open) {
+    return null;
+  }
+
+  const iconOptions: Array<{
+    key: EnvironmentCommandIcon;
+    label: string;
+    icon: React.ReactNode;
+  }> = [
+    { key: "run", label: "运行", icon: <CommandRunIcon size={16} /> },
+    { key: "tool", label: "工具", icon: <CommandToolIcon size={16} /> },
+    { key: "test", label: "测试", icon: <CommandTestIcon size={16} /> },
+    { key: "other", label: "其他", icon: <CommandOtherIcon size={16} /> },
+  ];
+
+  return (
+    <div
+      onClick={() => {
+        if (!busy) {
+          onClose();
+        }
+      }}
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(15, 23, 42, 0.46)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "24px",
+        zIndex: 2100,
+      }}
+    >
+      <div
+        onClick={(event) => event.stopPropagation()}
+        style={{
+          width: "min(480px, 100%)",
+          background: "var(--menu-bg)",
+          borderRadius: "20px",
+          padding: "22px",
+          boxShadow: "0 28px 80px rgba(15, 23, 42, 0.22)",
+          border: "1px solid var(--border-color)",
+          display: "flex",
+          flexDirection: "column",
+          gap: "14px",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "12px",
+          }}
+        >
+          <div>
+            <div
+              style={{
+                fontSize: "18px",
+                fontWeight: 700,
+                color: "var(--text-primary)",
+              }}
+            >
+              添加操作
+            </div>
+            <div style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
+              保存在 .mindfs\environments\environment.toml
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={busy}
+            style={{
+              border: "none",
+              background: "transparent",
+              color: "var(--text-secondary)",
+              cursor: busy ? "not-allowed" : "pointer",
+              fontSize: "18px",
+              lineHeight: 1,
+              padding: 0,
+            }}
+          >
+            ✕
+          </button>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+          <div style={{ fontSize: "12px", fontWeight: 600, color: "var(--text-primary)" }}>
+            图标
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: "8px" }}>
+            {iconOptions.map((option) => {
+              const selected = value.icon === option.key;
+              return (
+                <button
+                  key={option.key}
+                  type="button"
+                  onClick={() => onChange({ ...value, icon: option.key })}
+                  style={{
+                    border: selected
+                      ? "1px solid var(--accent-color)"
+                      : "1px solid var(--border-color)",
+                    background: selected ? "rgba(59, 130, 246, 0.08)" : "transparent",
+                    borderRadius: "12px",
+                    padding: "10px 8px",
+                    display: "flex",
+                    flexDirection: "column",
+                    alignItems: "center",
+                    gap: "6px",
+                    cursor: "pointer",
+                    color: "var(--text-primary)",
+                    fontSize: "12px",
+                  }}
+                >
+                  {option.icon}
+                  <span>{option.label}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+        <label style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+          <span style={{ fontSize: "12px", fontWeight: 600, color: "var(--text-primary)" }}>
+            名称
+          </span>
+          <input
+            type="text"
+            value={value.name}
+            disabled={busy}
+            autoFocus
+            onChange={(event) => onChange({ ...value, name: event.target.value })}
+            placeholder="例如：启动开发服务"
+            style={{
+              width: "100%",
+              borderRadius: "10px",
+              border: "1px solid var(--border-color)",
+              background: "transparent",
+              color: "var(--text-primary)",
+              fontSize: "13px",
+              padding: "10px 12px",
+              outline: "none",
+              boxSizing: "border-box",
+            }}
+          />
+        </label>
+        <label style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+          <span style={{ fontSize: "12px", fontWeight: 600, color: "var(--text-primary)" }}>
+            命令
+          </span>
+          <textarea
+            value={value.command}
+            disabled={busy}
+            onChange={(event) => onChange({ ...value, command: event.target.value })}
+            placeholder="例如：npm run dev"
+            rows={4}
+            style={{
+              width: "100%",
+              borderRadius: "10px",
+              border: "1px solid var(--border-color)",
+              background: "transparent",
+              color: "var(--text-primary)",
+              fontSize: "13px",
+              padding: "10px 12px",
+              outline: "none",
+              boxSizing: "border-box",
+              resize: "vertical",
+              minHeight: "96px",
+              fontFamily: "inherit",
+            }}
+          />
+        </label>
+        <label
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            fontSize: "12px",
+            color: "var(--text-primary)",
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={value.setDefault}
+            disabled={busy}
+            onChange={(event) =>
+              onChange({ ...value, setDefault: event.target.checked })
+            }
+          />
+          设为默认操作
+        </label>
+        {error ? (
+          <div style={{ fontSize: "12px", color: "#d97706" }}>{error}</div>
+        ) : null}
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: "10px" }}>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={busy}
+            style={{
+              border: "1px solid var(--border-color)",
+              background: "transparent",
+              color: "var(--text-secondary)",
+              borderRadius: "10px",
+              padding: "9px 14px",
+              fontSize: "12px",
+              cursor: busy ? "not-allowed" : "pointer",
+            }}
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              void onSubmit();
+            }}
+            disabled={busy}
+            style={{
+              border: "none",
+              background: "var(--accent-color)",
+              color: "#fff",
+              borderRadius: "10px",
+              padding: "9px 14px",
+              fontSize: "12px",
+              fontWeight: 600,
+              cursor: busy ? "not-allowed" : "pointer",
+              opacity: busy ? 0.7 : 1,
+            }}
+          >
+            {busy ? "保存中..." : "保存"}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -574,7 +1901,10 @@ function parsePluginQuery(search: string): Record<string, string> {
 }
 
 function waitForNextPaint(): Promise<void> {
-  if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
+  if (
+    typeof window === "undefined" ||
+    typeof window.requestAnimationFrame !== "function"
+  ) {
     return new Promise((resolve) => setTimeout(resolve, 0));
   }
   return new Promise((resolve) => {
@@ -779,7 +2109,9 @@ function parseFileLocation(path: string): {
       return {
         path: base,
         targetLine:
-          Number.isFinite(targetLine) && targetLine > 0 ? targetLine : undefined,
+          Number.isFinite(targetLine) && targetLine > 0
+            ? targetLine
+            : undefined,
         targetColumn:
           targetColumn && Number.isFinite(targetColumn) && targetColumn > 0
             ? targetColumn
@@ -865,7 +2197,9 @@ function loadBooleanRecord(key: string): Record<string, boolean> {
     return {};
   }
   try {
-    const parsed = JSON.parse(window.localStorage.getItem(key) || "{}") as Record<string, unknown>;
+    const parsed = JSON.parse(
+      window.localStorage.getItem(key) || "{}",
+    ) as Record<string, unknown>;
     return Object.fromEntries(
       Object.entries(parsed).filter(([, value]) => typeof value === "boolean"),
     ) as Record<string, boolean>;
@@ -874,18 +2208,24 @@ function loadBooleanRecord(key: string): Record<string, boolean> {
   }
 }
 
-function loadStringBooleanRecord(key: string): Record<string, Record<string, boolean>> {
+function loadStringBooleanRecord(
+  key: string,
+): Record<string, Record<string, boolean>> {
   if (typeof window === "undefined") {
     return {};
   }
   try {
-    const parsed = JSON.parse(window.localStorage.getItem(key) || "{}") as Record<string, unknown>;
+    const parsed = JSON.parse(
+      window.localStorage.getItem(key) || "{}",
+    ) as Record<string, unknown>;
     return Object.fromEntries(
       Object.entries(parsed).map(([root, value]) => [
         root,
         value && typeof value === "object"
           ? Object.fromEntries(
-              Object.entries(value as Record<string, unknown>).filter(([, expanded]) => typeof expanded === "boolean"),
+              Object.entries(value as Record<string, unknown>).filter(
+                ([, expanded]) => typeof expanded === "boolean",
+              ),
             )
           : {},
       ]),
@@ -935,11 +2275,15 @@ export function App({ onGoHome }: AppProps) {
   const cancelRequestedBySessionRef = useRef<Record<string, boolean>>({});
   const sessionCacheRef = useRef<Record<string, Session>>({});
   const loadedSessionRef = useRef<Record<string, boolean>>({});
-  const loadingSessionRef = useRef<Record<string, Promise<SyncSessionResult>>>({});
+  const loadingSessionRef = useRef<Record<string, Promise<SyncSessionResult>>>(
+    {},
+  );
   const staleSessionKeysRef = useRef<Set<string>>(new Set());
   const invalidTreeCacheKeysRef = useRef<Set<string>>(new Set());
   const boundSessionByRootRef = useRef<Record<string, string | null>>({});
-  const suppressedAutoBindSessionByRootRef = useRef<Record<string, string | null>>({});
+  const suppressedAutoBindSessionByRootRef = useRef<
+    Record<string, string | null>
+  >({});
   const drawerSessionByRootRef = useRef<Record<string, SessionItem | null>>({});
   const selectedSessionByRootRef = useRef<Record<string, string | null>>({});
   const mainViewPreferenceByRootRef = useRef<
@@ -962,7 +2306,9 @@ export function App({ onGoHome }: AppProps) {
   const pluginsLoadedByRootRef = useRef<Record<string, boolean>>({});
   const pluginsLoadingByRootRef = useRef<Record<string, Promise<void>>>({});
   const didInitRef = useRef(false);
-  const managedRootsRequestRef = useRef<Promise<ManagedRootPayload[] | null> | null>(null);
+  const managedRootsRequestRef = useRef<Promise<
+    ManagedRootPayload[] | null
+  > | null>(null);
   const handleSelectSessionRef = useRef<
     ((session: any) => Promise<void>) | null
   >(null);
@@ -970,10 +2316,14 @@ export function App({ onGoHome }: AppProps) {
   const [sessions, setSessions] = useState<SessionItem[]>([]);
   const sessionsRef = useRef<SessionItem[]>([]);
   const [sessionSearchOpen, setSessionSearchOpen] = useState(false);
-  const [sessionSearchResultsMode, setSessionSearchResultsMode] = useState(false);
+  const [sessionSearchResultsMode, setSessionSearchResultsMode] =
+    useState(false);
   const [sessionSearchQuery, setSessionSearchQuery] = useState("");
-  const [sessionSearchAppliedQuery, setSessionSearchAppliedQuery] = useState("");
-  const [sessionSearchResults, setSessionSearchResults] = useState<SessionItem[]>([]);
+  const [sessionSearchAppliedQuery, setSessionSearchAppliedQuery] =
+    useState("");
+  const [sessionSearchResults, setSessionSearchResults] = useState<
+    SessionItem[]
+  >([]);
   const [sessionSearchLoading, setSessionSearchLoading] = useState(false);
   const [hasMoreSessions, setHasMoreSessions] = useState(false);
   const [loadingOlderSessions, setLoadingOlderSessions] = useState(false);
@@ -1003,7 +2353,9 @@ export function App({ onGoHome }: AppProps) {
   const [activeBoundSessionKey, setActiveBoundSessionKey] = useState<
     string | null
   >(null);
-  const [currentSession, setCurrentSession] = useState<SessionItem | null>(null);
+  const [currentSession, setCurrentSession] = useState<SessionItem | null>(
+    null,
+  );
   const [cacheVersion, setCacheVersion] = useState(0);
   const [interactionMode, setInteractionMode] = useState<"main" | "drawer">(
     "main",
@@ -1021,15 +2373,21 @@ export function App({ onGoHome }: AppProps) {
   const managedRootByIdRef = useRef<Record<string, ManagedRootPayload>>({});
   const [rootEntries, setRootEntries] = useState<FileEntry[]>([]);
   const [creatingRootName, setCreatingRootName] = useState<string | null>(null);
-  const [creatingRootParentPath, setCreatingRootParentPath] = useState<string | null>(null);
-  const [creatingRootKind, setCreatingRootKind] = useState<"root" | "worktree">("root");
+  const [creatingRootParentPath, setCreatingRootParentPath] = useState<
+    string | null
+  >(null);
+  const [creatingRootKind, setCreatingRootKind] = useState<"root" | "worktree">(
+    "root",
+  );
   const [creatingRootBusy, setCreatingRootBusy] = useState(false);
   const [worktreeBranches, setWorktreeBranches] = useState<GitBranchesPayload>({
     branches: [],
   });
   const [worktreeBranchesLoading, setWorktreeBranchesLoading] = useState(false);
   const [worktreeBranchError, setWorktreeBranchError] = useState("");
-  const [worktreeBranchMode, setWorktreeBranchMode] = useState<"new" | "existing">("new");
+  const [worktreeBranchMode, setWorktreeBranchMode] = useState<
+    "new" | "existing"
+  >("new");
   const [worktreeBranch, setWorktreeBranch] = useState("");
   const [projectAddMode, setProjectAddMode] = useState<ProjectAddMode | null>(
     null,
@@ -1043,17 +2401,19 @@ export function App({ onGoHome }: AppProps) {
     adding: false,
     error: "",
   });
-  const [githubImportState, setGitHubImportState] = useState<GitHubImportState>({
-    url: "",
-    parentPath: "",
-    taskId: "",
-    status: "",
-    message: "",
-    running: false,
-    submitting: false,
-    done: false,
-    error: "",
-  });
+  const [githubImportState, setGitHubImportState] = useState<GitHubImportState>(
+    {
+      url: "",
+      parentPath: "",
+      taskId: "",
+      status: "",
+      message: "",
+      running: false,
+      submitting: false,
+      done: false,
+      error: "",
+    },
+  );
   const [relayStatus, setRelayStatus] = useState<RelayStatusPayload | null>(
     null,
   );
@@ -1086,9 +2446,9 @@ export function App({ onGoHome }: AppProps) {
     }
     return window.localStorage.getItem(SHOW_GIT_HISTORY_STORAGE_KEY) !== "0";
   });
-  const [gitHistoryExpandedByRoot, setGitHistoryExpandedByRoot] = useState<Record<string, Record<string, boolean>>>(() =>
-    loadStringBooleanRecord(GIT_HISTORY_EXPANDED_STORAGE_KEY),
-  );
+  const [gitHistoryExpandedByRoot, setGitHistoryExpandedByRoot] = useState<
+    Record<string, Record<string, boolean>>
+  >(() => loadStringBooleanRecord(GIT_HISTORY_EXPANDED_STORAGE_KEY));
   const [gitDiff, setGitDiff] = useState<GitDiffPayload | null>(null);
   const [treeSortMode, setTreeSortMode] = useState<DirectorySortMode>(() => {
     if (typeof window === "undefined") {
@@ -1126,7 +2486,24 @@ export function App({ onGoHome }: AppProps) {
     useState<ViewerSelection | null>(null);
   const [attachedFileContext, setAttachedFileContext] =
     useState<AttachedFileContext | null>(null);
-  const [vscodeLaunching, setVSCodeLaunching] = useState(false);
+  const [environmentCommands, setEnvironmentCommands] = useState<
+    EnvironmentCommand[]
+  >([]);
+  const [environmentCommandRuns, setEnvironmentCommandRuns] = useState<
+    Record<string, EnvironmentCommandRunState>
+  >({});
+  const [environmentCommandsLoading, setEnvironmentCommandsLoading] =
+    useState(false);
+  const [environmentCommandBusy, setEnvironmentCommandBusy] = useState(false);
+  const [commandDialogOpen, setCommandDialogOpen] = useState(false);
+  const [commandDialogError, setCommandDialogError] = useState("");
+  const [commandForm, setCommandForm] = useState<CommandFormState>({
+    name: "",
+    icon: "run",
+    command: "",
+    setDefault: false,
+  });
+  const [externalLaunchBusy, setExternalLaunchBusy] = useState(false);
   const [pluginVersion, setPluginVersion] = useState(0);
   const [pluginLoading, setPluginLoading] = useState(false);
   const [pluginBypass, setPluginBypass] = useState(false);
@@ -1282,7 +2659,12 @@ export function App({ onGoHome }: AppProps) {
     return () => {
       cancelled = true;
     };
-  }, [agentsVersion, e2eeState.configured, e2eeState.required, e2eeState.unlocked]);
+  }, [
+    agentsVersion,
+    e2eeState.configured,
+    e2eeState.required,
+    e2eeState.unlocked,
+  ]);
   useEffect(() => {
     if (!importMenuOpen) return;
     const handlePointerDown = (event: MouseEvent) => {
@@ -1385,13 +2767,19 @@ export function App({ onGoHome }: AppProps) {
     if (typeof window === "undefined") {
       return;
     }
-    window.localStorage.setItem(SHOW_GIT_HISTORY_STORAGE_KEY, showGitHistory ? "1" : "0");
+    window.localStorage.setItem(
+      SHOW_GIT_HISTORY_STORAGE_KEY,
+      showGitHistory ? "1" : "0",
+    );
   }, [showGitHistory]);
   useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
-    window.localStorage.setItem(GIT_HISTORY_EXPANDED_STORAGE_KEY, JSON.stringify(gitHistoryExpandedByRoot));
+    window.localStorage.setItem(
+      GIT_HISTORY_EXPANDED_STORAGE_KEY,
+      JSON.stringify(gitHistoryExpandedByRoot),
+    );
   }, [gitHistoryExpandedByRoot]);
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -1422,7 +2810,10 @@ export function App({ onGoHome }: AppProps) {
   );
 
   const setDrawerSessionForRoot = useCallback(
-    (rootID: string | null | undefined, session: Session | SessionItem | null) => {
+    (
+      rootID: string | null | undefined,
+      session: Session | SessionItem | null,
+    ) => {
       if (!rootID) return;
       const next = toSessionItem(rootID, session);
       drawerSessionByRootRef.current[rootID] = next;
@@ -1652,7 +3043,10 @@ export function App({ onGoHome }: AppProps) {
         return true;
       }
       const drawer = drawerSessionByRootRef.current[resolvedRoot] as
-        | ({ pending?: boolean; key?: string; session_key?: string } & Record<string, unknown>)
+        | ({ pending?: boolean; key?: string; session_key?: string } & Record<
+            string,
+            unknown
+          >)
         | null
         | undefined;
       if (
@@ -1663,13 +3057,18 @@ export function App({ onGoHome }: AppProps) {
         return drawer.pending;
       }
       const selected = selectedSessionRef.current as
-        | ({ pending?: boolean; key?: string; session_key?: string; root_id?: string } & Record<string, unknown>)
+        | ({
+            pending?: boolean;
+            key?: string;
+            session_key?: string;
+            root_id?: string;
+          } & Record<string, unknown>)
         | null
         | undefined;
       if (
         selected &&
-        ((selected.root_id as string | undefined) || currentRootIdRef.current) ===
-          resolvedRoot &&
+        ((selected.root_id as string | undefined) ||
+          currentRootIdRef.current) === resolvedRoot &&
         (selected.key || selected.session_key) === resolvedKey &&
         typeof selected.pending === "boolean"
       ) {
@@ -1688,37 +3087,52 @@ export function App({ onGoHome }: AppProps) {
   );
 
   const markSessionStale = useCallback(
-    (rootID: string | null | undefined, sessionKey: string | null | undefined) => {
+    (
+      rootID: string | null | undefined,
+      sessionKey: string | null | undefined,
+    ) => {
       const resolvedRoot = String(rootID || "");
       const resolvedKey = String(sessionKey || "");
       if (!resolvedRoot || !resolvedKey || resolvedKey.startsWith("pending-")) {
         return;
       }
-      staleSessionKeysRef.current.add(rootSessionKey(resolvedRoot, resolvedKey));
+      staleSessionKeysRef.current.add(
+        rootSessionKey(resolvedRoot, resolvedKey),
+      );
     },
     [rootSessionKey],
   );
 
   const clearSessionStale = useCallback(
-    (rootID: string | null | undefined, sessionKey: string | null | undefined) => {
+    (
+      rootID: string | null | undefined,
+      sessionKey: string | null | undefined,
+    ) => {
       const resolvedRoot = String(rootID || "");
       const resolvedKey = String(sessionKey || "");
       if (!resolvedRoot || !resolvedKey) {
         return;
       }
-      staleSessionKeysRef.current.delete(rootSessionKey(resolvedRoot, resolvedKey));
+      staleSessionKeysRef.current.delete(
+        rootSessionKey(resolvedRoot, resolvedKey),
+      );
     },
     [rootSessionKey],
   );
 
   const isSessionStale = useCallback(
-    (rootID: string | null | undefined, sessionKey: string | null | undefined): boolean => {
+    (
+      rootID: string | null | undefined,
+      sessionKey: string | null | undefined,
+    ): boolean => {
       const resolvedRoot = String(rootID || "");
       const resolvedKey = String(sessionKey || "");
       if (!resolvedRoot || !resolvedKey) {
         return false;
       }
-      return staleSessionKeysRef.current.has(rootSessionKey(resolvedRoot, resolvedKey));
+      return staleSessionKeysRef.current.has(
+        rootSessionKey(resolvedRoot, resolvedKey),
+      );
     },
     [rootSessionKey],
   );
@@ -1957,8 +3371,7 @@ export function App({ onGoHome }: AppProps) {
           ? selected.name
           : "") ||
         "新会话";
-      const latestReal =
-        realCached || pendingCached || fallback || drawer;
+      const latestReal = realCached || pendingCached || fallback || drawer;
       let cacheChanged = false;
 
       if (pendingCached) {
@@ -2020,7 +3433,12 @@ export function App({ onGoHome }: AppProps) {
         bumpCacheVersion();
       }
     },
-    [rootSessionKey, setBoundSessionForRoot, setDrawerSessionForRoot, bumpCacheVersion],
+    [
+      rootSessionKey,
+      setBoundSessionForRoot,
+      setDrawerSessionForRoot,
+      bumpCacheVersion,
+    ],
   );
 
   const resolveAgentForSession = useCallback(
@@ -2271,7 +3689,10 @@ export function App({ onGoHome }: AppProps) {
       contextWindow?: { totalTokens?: number; modelContextWindow?: number },
     ) => {
       const totalTokens = Math.max(0, Number(contextWindow?.totalTokens || 0));
-      const modelContextWindow = Math.max(0, Number(contextWindow?.modelContextWindow || 0));
+      const modelContextWindow = Math.max(
+        0,
+        Number(contextWindow?.modelContextWindow || 0),
+      );
       if (!totalTokens || !modelContextWindow) {
         return;
       }
@@ -2298,7 +3719,9 @@ export function App({ onGoHome }: AppProps) {
       };
       const cached = sessionCacheRef.current[cacheKey];
       if (cached) {
-        const exchanges = stampList((((cached as any).exchanges || []) as Exchange[]));
+        const exchanges = stampList(
+          ((cached as any).exchanges || []) as Exchange[],
+        );
         sessionCacheRef.current[cacheKey] = {
           ...(cached as any),
           exchanges,
@@ -2312,12 +3735,16 @@ export function App({ onGoHome }: AppProps) {
       setSelectedSession((prev) => {
         const prevRoot =
           (prev?.root_id as string | undefined) || currentRootIdRef.current;
-        if (!prev || prevRoot !== rootID || (prev.key || prev.session_key) !== sessionKey) {
+        if (
+          !prev ||
+          prevRoot !== rootID ||
+          (prev.key || prev.session_key) !== sessionKey
+        ) {
           return prev;
         }
         return {
           ...(prev as any),
-          exchanges: stampList((((prev as any).exchanges || []) as Exchange[])),
+          exchanges: stampList(((prev as any).exchanges || []) as Exchange[]),
           context_window: {
             totalTokens,
             modelContextWindow,
@@ -2328,7 +3755,7 @@ export function App({ onGoHome }: AppProps) {
       if (drawer && drawer.key === sessionKey) {
         setDrawerSessionForRoot(rootID, {
           ...(drawer as any),
-          exchanges: stampList((((drawer as any).exchanges || []) as Exchange[])),
+          exchanges: stampList(((drawer as any).exchanges || []) as Exchange[]),
           context_window: {
             totalTokens,
             modelContextWindow,
@@ -2373,7 +3800,10 @@ export function App({ onGoHome }: AppProps) {
     async (rootID: string, dirPath: string, syncMain: boolean) => {
       try {
         const payload = await apiProtectedJSON<any>(
-          appURL("/api/tree", new URLSearchParams({ root: rootID, dir: dirPath })),
+          appURL(
+            "/api/tree",
+            new URLSearchParams({ root: rootID, dir: dirPath }),
+          ),
         );
         const parsed = normalizeTreeResponse(payload);
         invalidTreeCacheKeysRef.current.delete(treeCacheKey(rootID, dirPath));
@@ -2491,66 +3921,77 @@ export function App({ onGoHome }: AppProps) {
     }
   }, []);
 
-  const refreshGitHistory = useCallback(async (rootID: string, options?: { force?: boolean }) => {
-    if (!rootID) {
-      setGitHistory(null);
-      setGitHistoryLoading(false);
-      return null;
-    }
-    if (!options?.force) {
-      const cachedHead = getCachedGitHistoryHead(rootID);
-      if (cachedHead) {
-        setGitHistory(cachedHead);
-        const newest = cachedHead.items[0]?.hash || "";
-        if (newest) {
-          void fetchGitHistory(rootID, { afterCommit: newest })
-            .then((next) => {
-              if (next.commit_missing) {
-                clearGitHistoryCache(rootID);
-                return fetchGitHistory(rootID, { force: true });
-              }
-              return getCachedGitHistoryHead(rootID) || next;
-            })
-            .then((fresh) => {
-              if (currentRootIdRef.current === rootID) {
-                setGitHistory(fresh);
-              }
-            })
-            .catch((err) => {
-              console.error("[git.history.after] failed", { rootID, afterCommit: newest, err });
-            });
-        }
-        return cachedHead;
-      }
-    }
-    setGitHistoryLoading(true);
-    try {
-      const next = await fetchGitHistory(rootID, { force: options?.force });
-      if (next.commit_missing) {
-        clearGitHistoryCache(rootID);
-        const fresh = await fetchGitHistory(rootID, { force: true });
-        if (currentRootIdRef.current === rootID) {
-          setGitHistory(fresh);
-        }
-        return fresh;
-      }
-      if (currentRootIdRef.current === rootID) {
-        setGitHistory(next);
-      }
-      return next;
-    } catch (err) {
-      console.error("[git.history] failed", { rootID, err });
-      const fallback = { available: false, items: [], has_more: false } as GitHistoryPayload;
-      if (currentRootIdRef.current === rootID) {
-        setGitHistory(fallback);
-      }
-      return fallback;
-    } finally {
-      if (currentRootIdRef.current === rootID) {
+  const refreshGitHistory = useCallback(
+    async (rootID: string, options?: { force?: boolean }) => {
+      if (!rootID) {
+        setGitHistory(null);
         setGitHistoryLoading(false);
+        return null;
       }
-    }
-  }, []);
+      if (!options?.force) {
+        const cachedHead = getCachedGitHistoryHead(rootID);
+        if (cachedHead) {
+          setGitHistory(cachedHead);
+          const newest = cachedHead.items[0]?.hash || "";
+          if (newest) {
+            void fetchGitHistory(rootID, { afterCommit: newest })
+              .then((next) => {
+                if (next.commit_missing) {
+                  clearGitHistoryCache(rootID);
+                  return fetchGitHistory(rootID, { force: true });
+                }
+                return getCachedGitHistoryHead(rootID) || next;
+              })
+              .then((fresh) => {
+                if (currentRootIdRef.current === rootID) {
+                  setGitHistory(fresh);
+                }
+              })
+              .catch((err) => {
+                console.error("[git.history.after] failed", {
+                  rootID,
+                  afterCommit: newest,
+                  err,
+                });
+              });
+          }
+          return cachedHead;
+        }
+      }
+      setGitHistoryLoading(true);
+      try {
+        const next = await fetchGitHistory(rootID, { force: options?.force });
+        if (next.commit_missing) {
+          clearGitHistoryCache(rootID);
+          const fresh = await fetchGitHistory(rootID, { force: true });
+          if (currentRootIdRef.current === rootID) {
+            setGitHistory(fresh);
+          }
+          return fresh;
+        }
+        if (currentRootIdRef.current === rootID) {
+          setGitHistory(next);
+        }
+        return next;
+      } catch (err) {
+        console.error("[git.history] failed", { rootID, err });
+        const fallback = {
+          available: false,
+          items: [],
+          has_more: false,
+        } as GitHistoryPayload;
+        if (currentRootIdRef.current === rootID) {
+          setGitHistory(fallback);
+        }
+        return fallback;
+      } finally {
+        if (currentRootIdRef.current === rootID) {
+          setGitHistoryLoading(false);
+        }
+      }
+    },
+    [],
+  );
 
   const loadMoreGitHistory = useCallback(async () => {
     const rootID = currentRootIdRef.current;
@@ -2680,7 +4121,12 @@ export function App({ onGoHome }: AppProps) {
     return () => {
       cancelled = true;
     };
-  }, [currentRootId, sessionListMode, sessionSearchAppliedQuery, sessionSearchOpen]);
+  }, [
+    currentRootId,
+    sessionListMode,
+    sessionSearchAppliedQuery,
+    sessionSearchOpen,
+  ]);
 
   const openGitDiff = useCallback(
     async (rootID: string, item: GitStatusItem) => {
@@ -2835,35 +4281,26 @@ export function App({ onGoHome }: AppProps) {
     [refreshGitStatus, refreshGitHistory],
   );
 
-  const handleGitStageFile = useCallback(
-    async (path: string) => {
-      const rootID = currentRootIdRef.current;
-      if (!rootID) return;
-      const nextStatus = await gitStageFile(rootID, path);
-      setGitStatus(nextStatus);
-    },
-    [],
-  );
+  const handleGitStageFile = useCallback(async (path: string) => {
+    const rootID = currentRootIdRef.current;
+    if (!rootID) return;
+    const nextStatus = await gitStageFile(rootID, path);
+    setGitStatus(nextStatus);
+  }, []);
 
-  const handleGitUnstageFile = useCallback(
-    async (path: string) => {
-      const rootID = currentRootIdRef.current;
-      if (!rootID) return;
-      const nextStatus = await gitUnstageFile(rootID, path);
-      setGitStatus(nextStatus);
-    },
-    [],
-  );
+  const handleGitUnstageFile = useCallback(async (path: string) => {
+    const rootID = currentRootIdRef.current;
+    if (!rootID) return;
+    const nextStatus = await gitUnstageFile(rootID, path);
+    setGitStatus(nextStatus);
+  }, []);
 
-  const handleGitStageAll = useCallback(
-    async () => {
-      const rootID = currentRootIdRef.current;
-      if (!rootID) return;
-      const nextStatus = await gitStageAll(rootID);
-      setGitStatus(nextStatus);
-    },
-    [],
-  );
+  const handleGitStageAll = useCallback(async () => {
+    const rootID = currentRootIdRef.current;
+    if (!rootID) return;
+    const nextStatus = await gitStageAll(rootID);
+    setGitStatus(nextStatus);
+  }, []);
 
   const handleGitRemoteAction = useCallback(
     async (action: GitRemoteAction) => {
@@ -2882,7 +4319,8 @@ export function App({ onGoHome }: AppProps) {
           }
         }
       } catch (err) {
-        const message = err instanceof Error ? err.message : `git ${action} failed`;
+        const message =
+          err instanceof Error ? err.message : `git ${action} failed`;
         console.error("[git.remote] failed", {
           rootID,
           action,
@@ -3104,7 +4542,9 @@ export function App({ onGoHome }: AppProps) {
         drawerSessionByRootRef.current[resolvedRoot]?.key || "",
       ).trim();
       const preferredKey =
-        (selectedKey && !selectedKey.startsWith("pending-") ? selectedKey : "") ||
+        (selectedKey && !selectedKey.startsWith("pending-")
+          ? selectedKey
+          : "") ||
         (boundKey && !boundKey.startsWith("pending-") ? boundKey : "") ||
         (drawerKey && !drawerKey.startsWith("pending-") ? drawerKey : "");
       if (!preferredKey) {
@@ -3566,7 +5006,8 @@ export function App({ onGoHome }: AppProps) {
         const targetSessionKey = sendSessionKey;
         const previousAgent = session.agent || "";
         const useTargetSessionDefaults =
-          !!currentBoundSessionKey && currentBoundSessionKey !== targetSessionKey;
+          !!currentBoundSessionKey &&
+          currentBoundSessionKey !== targetSessionKey;
         effectiveMode = normalizeMode(session.type as any);
         effectiveAgent =
           (useTargetSessionDefaults ? previousAgent : agent) ||
@@ -3576,11 +5017,15 @@ export function App({ onGoHome }: AppProps) {
           (useTargetSessionDefaults ? session.model || "" : model) ||
           (effectiveAgent === previousAgent ? session.model || "" : "");
         effectiveAgentMode =
-          (useTargetSessionDefaults ? (session as any).mode || "" : agentMode) ||
+          (useTargetSessionDefaults
+            ? (session as any).mode || ""
+            : agentMode) ||
           (effectiveAgent === previousAgent ? (session as any).mode || "" : "");
         effectiveEffort =
           (useTargetSessionDefaults ? (session as any).effort || "" : effort) ||
-          (effectiveAgent === previousAgent ? (session as any).effort || "" : "");
+          (effectiveAgent === previousAgent
+            ? (session as any).effort || ""
+            : "");
         effectiveFastService =
           (useTargetSessionDefaults
             ? (((session as any).fast_service || "") as "" | "on" | "off")
@@ -3731,8 +5176,14 @@ export function App({ onGoHome }: AppProps) {
       const currentFile = fileRef.current;
       if (currentFile && !pluginBypassRef.current) {
         try {
-          const pluginInput = toPluginInput(currentFile, pluginQueryRef.current);
-          const plugin = pluginManagerRef.current.match(activeRoot, pluginInput);
+          const pluginInput = toPluginInput(
+            currentFile,
+            pluginQueryRef.current,
+          );
+          const plugin = pluginManagerRef.current.match(
+            activeRoot,
+            pluginInput,
+          );
           if (plugin?.viewContext) {
             outgoingMessage = buildMessageWithViewContext(
               message,
@@ -3756,16 +5207,30 @@ export function App({ onGoHome }: AppProps) {
         context,
         requestId,
       );
-      console.info("[session/send] dispatched", { requestId, rootId: activeRoot, sessionKey: sendSessionKey || null, tempKey: tempKey || null, sent });
+      console.info("[session/send] dispatched", {
+        requestId,
+        rootId: activeRoot,
+        sessionKey: sendSessionKey || null,
+        tempKey: tempKey || null,
+        sent,
+      });
       if (!sent) {
-        console.warn("[session/send] dispatch_failed", { requestId, rootId: activeRoot, sessionKey: sendSessionKey || null });
-        reportError("network.disconnected", "消息发送失败：连接未就绪，请稍后重试", {
-          details: {
-            requestId,
-            rootId: activeRoot,
-            sessionKey: sendSessionKey || null,
-          },
+        console.warn("[session/send] dispatch_failed", {
+          requestId,
+          rootId: activeRoot,
+          sessionKey: sendSessionKey || null,
         });
+        reportError(
+          "network.disconnected",
+          "消息发送失败：连接未就绪，请稍后重试",
+          {
+            details: {
+              requestId,
+              rootId: activeRoot,
+              sessionKey: sendSessionKey || null,
+            },
+          },
+        );
         delete pendingRequestRef.current[requestId];
       }
       if (!sent && sendSessionKey) {
@@ -3808,8 +5273,14 @@ export function App({ onGoHome }: AppProps) {
 
   const handleNewSession = useCallback(() => {
     const rootID = currentRootIdRef.current;
-    const previousBoundKey = rootID ? boundSessionByRootRef.current[rootID] : "";
-    if (rootID && previousBoundKey && !previousBoundKey.startsWith("pending-")) {
+    const previousBoundKey = rootID
+      ? boundSessionByRootRef.current[rootID]
+      : "";
+    if (
+      rootID &&
+      previousBoundKey &&
+      !previousBoundKey.startsWith("pending-")
+    ) {
       suppressedAutoBindSessionByRootRef.current[rootID] = previousBoundKey;
     }
     setMainViewPreferenceForRoot(rootID, "session");
@@ -3904,58 +5375,396 @@ export function App({ onGoHome }: AppProps) {
     [],
   );
 
-  const handleOpenInVSCode = useCallback(async () => {
-    const rootID = currentRootIdRef.current;
-    if (!rootID || vscodeLaunching) {
-      return;
-    }
-    const currentRoot = managedRootByIdRef.current[rootID];
-    const rootPath = String(currentRoot?.root_path || "").trim();
-    const currentFile = fileRef.current;
-    const currentFilePath =
-      currentFile && (!currentFile.root || currentFile.root === rootID)
-        ? currentFile.path
-        : "";
-    const selectedLine =
-      viewerSelectionRef.current?.filePath === currentFilePath
-        ? viewerSelectionRef.current?.startLine
-        : undefined;
-    setVSCodeLaunching(true);
-    try {
-      await launchVSCode({
-        rootId: rootID,
-        path: currentFilePath || undefined,
-        line: selectedLine || currentFile?.targetLine,
-        column: currentFile?.targetColumn,
-      });
-    } catch (err) {
-      if (err instanceof ProtectedAPIError && err.status === 404 && rootPath) {
-        const separator = /^[A-Za-z]:[\\/]/.test(rootPath) ? "\\" : "/";
-        const joinedPath = currentFilePath
-          ? `${rootPath.replace(/[\\/]+$/, "")}${separator}${currentFilePath.replace(/[\\/]/g, separator)}`
-          : rootPath;
-        openVSCodeProtocol(joinedPath);
+  const openCommandDialog = useCallback(() => {
+    setCommandDialogError("");
+    setCommandForm({
+      name: "",
+      icon: "run",
+      command: "",
+      setDefault: environmentCommands.length === 0,
+    });
+    setCommandDialogOpen(true);
+  }, [environmentCommands.length]);
+
+  const handleEnvironmentCommandEvent = useCallback(
+    (eventType: string, payload: Record<string, unknown>) => {
+      const rootID =
+        typeof payload.root_id === "string" ? payload.root_id.trim() : "";
+      const runID =
+        typeof payload.run_id === "string" ? payload.run_id.trim() : "";
+      if (!rootID || !runID) {
         return;
       }
-      const message =
-        err instanceof Error ? err.message : "打开 VS Code 失败";
-      console.error("[vscode.open] failed", {
-        rootID,
-        path: currentFilePath || undefined,
-        err,
+      setEnvironmentCommandRuns((prev) => {
+        const existing = prev[rootID];
+        const base: EnvironmentCommandRunState =
+          existing && existing.runId === runID
+            ? existing
+            : {
+                rootId: rootID,
+                runId: runID,
+                commandId:
+                  typeof payload.command_id === "string"
+                    ? payload.command_id
+                    : existing?.commandId || "",
+                name:
+                  typeof payload.name === "string"
+                    ? payload.name
+                    : existing?.name || "操作命令",
+                command:
+                  typeof payload.command === "string"
+                    ? payload.command
+                    : existing?.command || "",
+                target:
+                  typeof payload.target === "string"
+                    ? payload.target
+                    : existing?.target || "",
+                status:
+                  payload.status === "completed" || payload.status === "failed"
+                    ? payload.status
+                    : "running",
+                startedAt:
+                  typeof payload.started_at === "string"
+                    ? payload.started_at
+                    : existing?.startedAt,
+                finishedAt:
+                  typeof payload.finished_at === "string"
+                    ? payload.finished_at
+                    : existing?.finishedAt,
+                exitCode:
+                  typeof payload.exit_code === "number"
+                    ? payload.exit_code
+                    : existing?.exitCode,
+                error:
+                  typeof payload.error === "string" ? payload.error : existing?.error,
+                chunks: existing?.runId === runID ? existing.chunks : [],
+                expanded: true,
+              };
+        const next: EnvironmentCommandRunState = {
+          ...base,
+          commandId:
+            typeof payload.command_id === "string"
+              ? payload.command_id
+              : base.commandId,
+          name: typeof payload.name === "string" ? payload.name : base.name,
+          command:
+            typeof payload.command === "string" ? payload.command : base.command,
+          target:
+            typeof payload.target === "string" ? payload.target : base.target,
+          status:
+            payload.status === "completed" || payload.status === "failed"
+              ? payload.status
+              : payload.status === "running"
+                ? "running"
+                : base.status,
+          startedAt:
+            typeof payload.started_at === "string"
+              ? payload.started_at
+              : base.startedAt,
+          finishedAt:
+            typeof payload.finished_at === "string"
+              ? payload.finished_at
+              : base.finishedAt,
+          exitCode:
+            typeof payload.exit_code === "number"
+              ? payload.exit_code
+              : base.exitCode,
+          error: typeof payload.error === "string" ? payload.error : base.error,
+          expanded: true,
+        };
+        if (eventType === "environment.command.output") {
+          const text =
+            typeof payload.chunk === "string"
+              ? stripAnsiEscapeSequences(payload.chunk)
+              : "";
+          if (text) {
+            const stream =
+              payload.stream === "stderr" ? "stderr" : "stdout";
+            next.chunks = [
+              ...base.chunks,
+              {
+                id: `${runID}:${base.chunks.length}:${stream}`,
+                stream,
+                text,
+              },
+            ];
+          }
+        }
+        return {
+          ...prev,
+          [rootID]: next,
+        };
       });
-      reportError("app.init_failed", message, {
-        severity: "error",
-        recoverable: true,
-        details: {
-          root: rootID,
-          path: currentFilePath || undefined,
-        },
-      });
-    } finally {
-      setVSCodeLaunching(false);
+    },
+    [],
+  );
+
+  const toggleEnvironmentCommandPanel = useCallback((rootID: string) => {
+    if (!rootID) {
+      return;
     }
-  }, [vscodeLaunching]);
+    setEnvironmentCommandRuns((prev) => {
+      const current = prev[rootID];
+      if (!current) {
+        return prev;
+      }
+      return {
+        ...prev,
+        [rootID]: {
+          ...current,
+          expanded: !current.expanded,
+        },
+      };
+    });
+  }, []);
+
+  const openEnvironmentCommandPanel = useCallback((rootID: string) => {
+    if (!rootID) {
+      return;
+    }
+    setEnvironmentCommandRuns((prev) => {
+      const current = prev[rootID];
+      if (!current || current.expanded) {
+        return prev;
+      }
+      return {
+        ...prev,
+        [rootID]: {
+          ...current,
+          expanded: true,
+        },
+      };
+    });
+  }, []);
+
+  const clearEnvironmentCommandPanel = useCallback((rootID: string) => {
+    if (!rootID) {
+      return;
+    }
+    setEnvironmentCommandRuns((prev) => {
+      if (!prev[rootID]) {
+        return prev;
+      }
+      const next = { ...prev };
+      delete next[rootID];
+      return next;
+    });
+  }, []);
+
+  const loadEnvironmentCommands = useCallback(async (rootID: string) => {
+    setEnvironmentCommandsLoading(true);
+    try {
+      const items = await fetchEnvironmentCommands(rootID);
+      if (currentRootIdRef.current === rootID) {
+        setEnvironmentCommands(items);
+      }
+    } catch (err) {
+      if (currentRootIdRef.current === rootID) {
+        setEnvironmentCommands([]);
+      }
+      console.error("[environment.commands] list failed", { rootID, err });
+    } finally {
+      if (currentRootIdRef.current === rootID) {
+        setEnvironmentCommandsLoading(false);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!currentRootId) {
+      setEnvironmentCommands([]);
+      setEnvironmentCommandsLoading(false);
+      setCommandDialogOpen(false);
+      setCommandDialogError("");
+      return;
+    }
+    void loadEnvironmentCommands(currentRootId);
+  }, [currentRootId, loadEnvironmentCommands]);
+
+  const handleSaveEnvironmentCommand = useCallback(async () => {
+    const rootID = currentRootIdRef.current;
+    if (!rootID || environmentCommandBusy) {
+      return;
+    }
+    const trimmedName = commandForm.name.trim();
+    const trimmedCommand = commandForm.command.trim();
+    if (!trimmedName) {
+      setCommandDialogError("请输入操作名称");
+      return;
+    }
+    if (!trimmedCommand) {
+      setCommandDialogError("请输入操作命令");
+      return;
+    }
+    setEnvironmentCommandBusy(true);
+    setCommandDialogError("");
+    try {
+      const items = await saveEnvironmentCommand({
+        rootId: rootID,
+        name: trimmedName,
+        icon: commandForm.icon,
+        command: trimmedCommand,
+        setDefault: commandForm.setDefault,
+      });
+      if (currentRootIdRef.current === rootID) {
+        setEnvironmentCommands(items);
+        setCommandDialogOpen(false);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "保存操作失败";
+      setCommandDialogError(message);
+    } finally {
+      if (currentRootIdRef.current === rootID) {
+        setEnvironmentCommandBusy(false);
+      }
+    }
+  }, [commandForm, environmentCommandBusy]);
+
+  const handleRunEnvironmentCommand = useCallback(
+    async (
+      command: EnvironmentCommand,
+      options?: { makeDefault?: boolean },
+    ) => {
+      const rootID = currentRootIdRef.current;
+      if (!rootID || environmentCommandBusy) {
+        return;
+      }
+      setEnvironmentCommandBusy(true);
+      try {
+        const result = await runEnvironmentCommand({
+          rootId: rootID,
+          commandId: command.id,
+          makeDefault: options?.makeDefault,
+        });
+        setEnvironmentCommandRuns((prev) => {
+          const existing = prev[rootID];
+          if (existing?.runId === result.run_id) {
+            return {
+              ...prev,
+              [rootID]: {
+                ...existing,
+                commandId: result.id,
+                name: result.name,
+                command: result.command,
+                target: result.target,
+                status: result.status,
+                startedAt: result.started_at || existing.startedAt,
+                expanded: true,
+              },
+            };
+          }
+          return {
+            ...prev,
+            [rootID]: {
+              rootId: result.root_id || rootID,
+              runId: result.run_id,
+              commandId: result.id,
+              name: result.name,
+              command: result.command,
+              target: result.target,
+              status: result.status,
+              startedAt: result.started_at,
+              chunks: [],
+              expanded: true,
+            },
+          };
+        });
+        if (options?.makeDefault && currentRootIdRef.current === rootID) {
+          setEnvironmentCommands((prev) =>
+            markDefaultEnvironmentCommand(prev, command.id),
+          );
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "运行操作失败";
+        console.error("[environment.commands] run failed", {
+          rootID,
+          commandID: command.id,
+          err,
+        });
+        reportError("environment.command_failed", message, {
+          severity: "error",
+          recoverable: true,
+          details: {
+            root: rootID,
+            command_id: command.id,
+          },
+        });
+      } finally {
+        if (currentRootIdRef.current === rootID) {
+          setEnvironmentCommandBusy(false);
+        }
+      }
+    },
+    [environmentCommandBusy],
+  );
+
+  const handleLaunchExternal = useCallback(
+    async (action: ExternalLaunchAction = "vscode") => {
+      const rootID = currentRootIdRef.current;
+      if (!rootID || externalLaunchBusy) {
+        return;
+      }
+      const currentRoot = managedRootByIdRef.current[rootID];
+      const rootPath = String(currentRoot?.root_path || "").trim();
+      const currentFile = fileRef.current;
+      const currentFilePath =
+        currentFile && (!currentFile.root || currentFile.root === rootID)
+          ? currentFile.path
+          : "";
+      const selectedLine =
+        viewerSelectionRef.current?.filePath === currentFilePath
+          ? viewerSelectionRef.current?.startLine
+          : undefined;
+      setExternalLaunchBusy(true);
+      try {
+        await launchVSCode({
+          rootId: rootID,
+          path: currentFilePath || undefined,
+          line: selectedLine || currentFile?.targetLine,
+          column: currentFile?.targetColumn,
+          action,
+        });
+      } catch (err) {
+        if (
+          action === "vscode" &&
+          err instanceof ProtectedAPIError &&
+          err.status === 404 &&
+          rootPath
+        ) {
+          const separator = /^[A-Za-z]:[\\/]/.test(rootPath) ? "\\" : "/";
+          const joinedPath = currentFilePath
+            ? `${rootPath.replace(/[\\/]+$/, "")}${separator}${currentFilePath.replace(/[\\/]/g, separator)}`
+            : rootPath;
+          openVSCodeProtocol(joinedPath);
+          return;
+        }
+        const fallbackMessage =
+          action === "explorer"
+            ? "打开文件资源管理器失败"
+            : action === "powershell"
+              ? "打开 PowerShell 终端失败"
+              : "打开 VS Code 失败";
+        const message = err instanceof Error ? err.message : fallbackMessage;
+        console.error("[external.open] failed", {
+          rootID,
+          action,
+          path: currentFilePath || undefined,
+          err,
+        });
+        reportError("app.init_failed", message, {
+          severity: "error",
+          recoverable: true,
+          details: {
+            root: rootID,
+            path: currentFilePath || undefined,
+          },
+        });
+      } finally {
+        setExternalLaunchBusy(false);
+      }
+    },
+    [externalLaunchBusy],
+  );
 
   useEffect(() => {
     const currentPath = currentSelectionSource?.path;
@@ -4295,13 +6104,17 @@ export function App({ onGoHome }: AppProps) {
               if (
                 await handleRelayNavigationFailure(
                   error.status,
-                  typeof error.payload?.error === "string" ? error.payload.error : "",
+                  typeof error.payload?.error === "string"
+                    ? error.payload.error
+                    : "",
                 )
               ) {
                 return;
               }
               const message = formatDirectoryLoadError(
-                typeof error.payload?.error === "string" ? error.payload.error : "",
+                typeof error.payload?.error === "string"
+                  ? error.payload.error
+                  : "",
               );
               setSelectedDir(targetPath);
               setSelectedDirKey(
@@ -4384,7 +6197,9 @@ export function App({ onGoHome }: AppProps) {
     }
     const request = (async () => {
       try {
-        const dirs = await apiProtectedJSON<ManagedRootPayload[]>(appPath("/api/dirs"));
+        const dirs = await apiProtectedJSON<ManagedRootPayload[]>(
+          appPath("/api/dirs"),
+        );
         return Array.isArray(dirs) ? dirs : [];
       } catch (error) {
         if (!(error instanceof ProtectedAPIError)) {
@@ -4471,23 +6286,28 @@ export function App({ onGoHome }: AppProps) {
     return bootstrapService.refreshRelayStatus();
   }, []);
 
-  const handleCreateRootStart = useCallback((parentPath?: string | null) => {
-    if (creatingRootBusy) {
-      return;
-    }
-    const existing = new Set(managedRootIdsRef.current);
-    let nextName = "new-root";
-    let suffix = 2;
-    while (existing.has(nextName)) {
-      nextName = `new-root-${suffix}`;
-      suffix += 1;
-    }
-    setCreatingRootParentPath(
-      parentPath && String(parentPath).trim() ? String(parentPath).trim() : null,
-    );
-    setCreatingRootKind("root");
-    setCreatingRootName(nextName);
-  }, [creatingRootBusy]);
+  const handleCreateRootStart = useCallback(
+    (parentPath?: string | null) => {
+      if (creatingRootBusy) {
+        return;
+      }
+      const existing = new Set(managedRootIdsRef.current);
+      let nextName = "new-root";
+      let suffix = 2;
+      while (existing.has(nextName)) {
+        nextName = `new-root-${suffix}`;
+        suffix += 1;
+      }
+      setCreatingRootParentPath(
+        parentPath && String(parentPath).trim()
+          ? String(parentPath).trim()
+          : null,
+      );
+      setCreatingRootKind("root");
+      setCreatingRootName(nextName);
+    },
+    [creatingRootBusy],
+  );
 
   const loadWorktreeBranches = useCallback(async (rootID: string) => {
     setWorktreeBranchesLoading(true);
@@ -4497,37 +6317,42 @@ export function App({ onGoHome }: AppProps) {
       setWorktreeBranches(payload);
     } catch (error) {
       setWorktreeBranches({ branches: [] });
-      setWorktreeBranchError(error instanceof Error ? error.message : "加载分支失败");
+      setWorktreeBranchError(
+        error instanceof Error ? error.message : "加载分支失败",
+      );
     } finally {
       setWorktreeBranchesLoading(false);
     }
   }, []);
 
-  const handleCreateWorktreeStart = useCallback((parentPath: string) => {
-    if (creatingRootBusy) {
-      return;
-    }
-    const rootID = currentRootIdRef.current;
-    if (!rootID) {
-      return;
-    }
-    const existing = new Set(managedRootIdsRef.current);
-    const baseName = `${rootID}-worktree`;
-    let nextName = baseName;
-    let suffix = 2;
-    while (existing.has(nextName)) {
-      nextName = `${baseName}-${suffix}`;
-      suffix += 1;
-    }
-    setCreatingRootKind("worktree");
-    setCreatingRootParentPath(parentPath);
-    setCreatingRootName(nextName);
-    setWorktreeBranchMode("new");
-    setWorktreeBranch("");
-    setWorktreeBranches({ branches: [] });
-    setWorktreeBranchError("");
-    void loadWorktreeBranches(rootID);
-  }, [creatingRootBusy, loadWorktreeBranches]);
+  const handleCreateWorktreeStart = useCallback(
+    (parentPath: string) => {
+      if (creatingRootBusy) {
+        return;
+      }
+      const rootID = currentRootIdRef.current;
+      if (!rootID) {
+        return;
+      }
+      const existing = new Set(managedRootIdsRef.current);
+      const baseName = `${rootID}-worktree`;
+      let nextName = baseName;
+      let suffix = 2;
+      while (existing.has(nextName)) {
+        nextName = `${baseName}-${suffix}`;
+        suffix += 1;
+      }
+      setCreatingRootKind("worktree");
+      setCreatingRootParentPath(parentPath);
+      setCreatingRootName(nextName);
+      setWorktreeBranchMode("new");
+      setWorktreeBranch("");
+      setWorktreeBranches({ branches: [] });
+      setWorktreeBranchError("");
+      void loadWorktreeBranches(rootID);
+    },
+    [creatingRootBusy, loadWorktreeBranches],
+  );
 
   const handleOpenProjectAdd = useCallback(() => {
     if (creatingRootBusy) {
@@ -4600,28 +6425,31 @@ export function App({ onGoHome }: AppProps) {
     }
   }, []);
 
-  const openDirectoryPicker = useCallback((nextMode: ProjectAddMode) => {
-    const rootID = currentRootIdRef.current;
-    const rootPath = rootID
-      ? String(managedRootByIdRef.current[rootID]?.root_path || "")
-      : "";
-    const initialPath = rootPath ? inferParentPath(rootPath) : "";
-    setProjectAddMode(nextMode);
-    if (!initialPath || initialPath === ".") {
-      setLocalDirState((prev) => ({
-        ...prev,
-        path: rootPath,
-        parent: "",
-        items: [],
-        loading: false,
-        selectedPath: "",
-        adding: false,
-        error: "当前项目缺少可浏览的父目录",
-      }));
-      return;
-    }
-    void loadLocalDirs(initialPath);
-  }, [inferParentPath, loadLocalDirs]);
+  const openDirectoryPicker = useCallback(
+    (nextMode: ProjectAddMode) => {
+      const rootID = currentRootIdRef.current;
+      const rootPath = rootID
+        ? String(managedRootByIdRef.current[rootID]?.root_path || "")
+        : "";
+      const initialPath = rootPath ? inferParentPath(rootPath) : "";
+      setProjectAddMode(nextMode);
+      if (!initialPath || initialPath === ".") {
+        setLocalDirState((prev) => ({
+          ...prev,
+          path: rootPath,
+          parent: "",
+          items: [],
+          loading: false,
+          selectedPath: "",
+          adding: false,
+          error: "当前项目缺少可浏览的父目录",
+        }));
+        return;
+      }
+      void loadLocalDirs(initialPath);
+    },
+    [inferParentPath, loadLocalDirs],
+  );
 
   const handleOpenLocalProjectAdd = useCallback(() => {
     void openDirectoryPicker("local");
@@ -4699,13 +6527,13 @@ export function App({ onGoHome }: AppProps) {
         if (!rootID || !parentPath) {
           throw new Error("缺少 worktree 创建位置");
         }
-        const created = await createGitWorktree({
+        const created = (await createGitWorktree({
           rootId: rootID,
           parentPath,
           name,
           branchMode: worktreeBranchMode,
           branch: worktreeBranchMode === "existing" ? worktreeBranch : "",
-        }) as ManagedRootPayload;
+        })) as ManagedRootPayload;
         setCreatingRootName(null);
         setCreatingRootParentPath(null);
         setCreatingRootKind("root");
@@ -4759,18 +6587,21 @@ export function App({ onGoHome }: AppProps) {
     worktreeBranchMode,
   ]);
 
-  const handleLocalDirSelect = useCallback((path: string) => {
-    setLocalDirState((prev) => {
-      const target = prev.items.find((item) => item.path === path);
-      if (!target) {
-        return prev;
-      }
-      if (projectAddMode === "local" && target.is_added_root) {
-        return prev;
-      }
-      return { ...prev, selectedPath: path };
-    });
-  }, [projectAddMode]);
+  const handleLocalDirSelect = useCallback(
+    (path: string) => {
+      setLocalDirState((prev) => {
+        const target = prev.items.find((item) => item.path === path);
+        if (!target) {
+          return prev;
+        }
+        if (projectAddMode === "local" && target.is_added_root) {
+          return prev;
+        }
+        return { ...prev, selectedPath: path };
+      });
+    },
+    [projectAddMode],
+  );
 
   const handleLocalDirAdd = useCallback(async () => {
     const path = String(localDirState.selectedPath || "").trim();
@@ -4835,7 +6666,16 @@ export function App({ onGoHome }: AppProps) {
         error: error instanceof Error ? error.message : "添加目录失败",
       }));
     }
-  }, [handleCreateRootStart, handleCreateWorktreeStart, loadLocalDirs, localDirState.adding, localDirState.path, localDirState.selectedPath, projectAddMode, refreshManagedRoots]);
+  }, [
+    handleCreateRootStart,
+    handleCreateWorktreeStart,
+    loadLocalDirs,
+    localDirState.adding,
+    localDirState.path,
+    localDirState.selectedPath,
+    projectAddMode,
+    refreshManagedRoots,
+  ]);
 
   const handleGitHubImportStart = useCallback(async () => {
     const url = String(githubImportState.url || "").trim();
@@ -4858,11 +6698,14 @@ export function App({ onGoHome }: AppProps) {
       message: "",
     }));
     try {
-      const payload = await apiProtectedJSON<any>(appPath("/api/imports/github"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url, parent_path: parentPath }),
-      });
+      const payload = await apiProtectedJSON<any>(
+        appPath("/api/imports/github"),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url, parent_path: parentPath }),
+        },
+      );
       setGitHubImportState((prev) => ({
         ...prev,
         taskId: String(payload?.task_id || ""),
@@ -4882,7 +6725,12 @@ export function App({ onGoHome }: AppProps) {
         error: error instanceof Error ? error.message : "GitHub 导入失败",
       }));
     }
-  }, [githubImportState.parentPath, githubImportState.running, githubImportState.submitting, githubImportState.url]);
+  }, [
+    githubImportState.parentPath,
+    githubImportState.running,
+    githubImportState.submitting,
+    githubImportState.url,
+  ]);
 
   const projectAddOverlay = projectAddMode ? (
     <div ref={projectAddPopoverRef}>
@@ -4902,9 +6750,7 @@ export function App({ onGoHome }: AppProps) {
         onLocalAdd={() => {
           void handleLocalDirAdd();
         }}
-        localActionLabel={
-          projectAddMode === "local" ? "添加" : "放置于此目录"
-        }
+        localActionLabel={projectAddMode === "local" ? "添加" : "放置于此目录"}
         localDisabledAddedRoot={projectAddMode === "local"}
         localBrowseOnly={
           projectAddMode === "blank_location" ||
@@ -4962,7 +6808,11 @@ export function App({ onGoHome }: AppProps) {
     if (!rootID) {
       return;
     }
-    if (!window.confirm(`确认移除 worktree“${rootID}”？\n这会删除该 worktree 目录，并从 MindFS 项目列表中移除。`)) {
+    if (
+      !window.confirm(
+        `确认移除 worktree“${rootID}”？\n这会删除该 worktree 目录，并从 MindFS 项目列表中移除。`,
+      )
+    ) {
       return;
     }
     try {
@@ -5141,8 +6991,10 @@ export function App({ onGoHome }: AppProps) {
 
   useEffect(() => {
     function openReplySession(detail: any) {
-      const rootId = typeof detail?.rootId === "string" ? detail.rootId.trim() : "";
-      const sessionKey = typeof detail?.sessionKey === "string" ? detail.sessionKey.trim() : "";
+      const rootId =
+        typeof detail?.rootId === "string" ? detail.rootId.trim() : "";
+      const sessionKey =
+        typeof detail?.sessionKey === "string" ? detail.sessionKey.trim() : "";
       if (!rootId || !sessionKey) {
         return;
       }
@@ -5153,11 +7005,17 @@ export function App({ onGoHome }: AppProps) {
       openReplySession((event as CustomEvent).detail);
     }
 
-    window.addEventListener("mindfs:open-reply-session", handleOpenReplySession);
+    window.addEventListener(
+      "mindfs:open-reply-session",
+      handleOpenReplySession,
+    );
     openReplySession((window as any).__mindfsPendingReplySession);
     delete (window as any).__mindfsPendingReplySession;
     return () => {
-      window.removeEventListener("mindfs:open-reply-session", handleOpenReplySession);
+      window.removeEventListener(
+        "mindfs:open-reply-session",
+        handleOpenReplySession,
+      );
     };
   }, [handleSessionChipClick]);
 
@@ -5383,7 +7241,11 @@ export function App({ onGoHome }: AppProps) {
         }
         const rootID = cacheKey.slice(0, separator);
         const sessionKey = cacheKey.slice(separator + 2);
-        if (!rootID || !sessionKey || !hasSessionExchanges(sessionCacheRef.current[cacheKey])) {
+        if (
+          !rootID ||
+          !sessionKey ||
+          !hasSessionExchanges(sessionCacheRef.current[cacheKey])
+        ) {
           continue;
         }
         markSessionStale(rootID, sessionKey);
@@ -5468,7 +7330,12 @@ export function App({ onGoHome }: AppProps) {
           pending = draft;
           pendingBySessionRef.current[ck] = draft;
           pendingDraftRef.current = null;
-          console.info("[session/stream] attach_pending_draft", { rootId: activeRoot, streamKey, requestId: draft.requestId, tempKey: draft.tempKey || null });
+          console.info("[session/stream] attach_pending_draft", {
+            rootId: activeRoot,
+            streamKey,
+            requestId: draft.requestId,
+            tempKey: draft.tempKey || null,
+          });
         }
       }
       const boundKey = boundSessionByRootRef.current[activeRoot] || "";
@@ -5486,15 +7353,16 @@ export function App({ onGoHome }: AppProps) {
         if (pending) {
           const pendingName =
             (drawerSessionByRootRef.current[activeRoot]?.key ===
-            pending.tempKey &&
+              pending.tempKey &&
             typeof (drawerSessionByRootRef.current[activeRoot] as any)?.name ===
               "string"
-              ? ((drawerSessionByRootRef.current[activeRoot] as any).name as string)
+              ? ((drawerSessionByRootRef.current[activeRoot] as any)
+                  .name as string)
               : "") ||
             ((selectedSessionRef.current?.key ||
               selectedSessionRef.current?.session_key) === pending.tempKey &&
-            (((selectedSessionRef.current?.root_id as string | undefined) ||
-              currentRootIdRef.current) === activeRoot) &&
+            ((selectedSessionRef.current?.root_id as string | undefined) ||
+              currentRootIdRef.current) === activeRoot &&
             typeof selectedSessionRef.current?.name === "string"
               ? selectedSessionRef.current.name
               : "") ||
@@ -5542,7 +7410,12 @@ export function App({ onGoHome }: AppProps) {
         }
       }
       if (pending?.tempKey) {
-        console.info("[session/stream] promote_pending", { rootId: activeRoot, tempKey: pending.tempKey, streamKey, requestId: pending.requestId });
+        console.info("[session/stream] promote_pending", {
+          rootId: activeRoot,
+          tempKey: pending.tempKey,
+          streamKey,
+          requestId: pending.requestId,
+        });
         promotePendingSessionForRoot(
           activeRoot,
           pending.tempKey,
@@ -5605,11 +7478,7 @@ export function App({ onGoHome }: AppProps) {
           updateDrawerIfShowingStream();
           break;
         case "todo_update":
-          appendTodoUpdateForSession(
-            activeRoot,
-            streamKey,
-            event.data || {},
-          );
+          appendTodoUpdateForSession(activeRoot, streamKey, event.data || {});
           updateDrawerIfShowingStream();
           break;
         case "message_done":
@@ -5799,15 +7668,31 @@ export function App({ onGoHome }: AppProps) {
         case "session.stream":
           handleSessionStream(payload);
           break;
+        case "environment.command.started":
+        case "environment.command.output":
+        case "environment.command.finished":
+          handleEnvironmentCommandEvent(event.type, payload);
+          break;
         case "session.accepted": {
           const requestId =
             typeof payload?.request_id === "string" ? payload.request_id : "";
           const pending = pendingRequestRef.current[requestId];
           if (!requestId || !pending) {
-            console.warn("[session/ws] accepted_without_pending", { requestId, payloadSessionKey: typeof payload?.session_key === "string" ? payload.session_key : null });
+            console.warn("[session/ws] accepted_without_pending", {
+              requestId,
+              payloadSessionKey:
+                typeof payload?.session_key === "string"
+                  ? payload.session_key
+                  : null,
+            });
             break;
           }
-          console.info("[session/ws] accepted", { requestId, rootId: pending.rootId, sessionKey: pending.sessionKey || null, tempKey: pending.tempKey || null });
+          console.info("[session/ws] accepted", {
+            requestId,
+            rootId: pending.rootId,
+            sessionKey: pending.sessionKey || null,
+            tempKey: pending.tempKey || null,
+          });
           delete pendingRequestRef.current[requestId];
           const acceptedSessionKey =
             typeof payload?.session_key === "string" ? payload.session_key : "";
@@ -5873,10 +7758,21 @@ export function App({ onGoHome }: AppProps) {
             ? pendingRequestRef.current[requestId]
             : null;
           if (!requestId || !pending) {
-            console.warn("[session/ws] error_without_pending", { requestId, payloadSessionKey: typeof payload?.session_key === "string" ? payload.session_key : null });
+            console.warn("[session/ws] error_without_pending", {
+              requestId,
+              payloadSessionKey:
+                typeof payload?.session_key === "string"
+                  ? payload.session_key
+                  : null,
+            });
             break;
           }
-          console.warn("[session/ws] error", { requestId, rootId: pending.rootId, sessionKey: pending.sessionKey || null, tempKey: pending.tempKey || null });
+          console.warn("[session/ws] error", {
+            requestId,
+            rootId: pending.rootId,
+            sessionKey: pending.sessionKey || null,
+            tempKey: pending.tempKey || null,
+          });
           delete pendingRequestRef.current[requestId];
           const targetKey = pending.tempKey || "";
           const rootID = pending.rootId;
@@ -5903,7 +7799,11 @@ export function App({ onGoHome }: AppProps) {
         case "session.done": {
           const sessionKey =
             typeof payload?.session_key === "string" ? payload.session_key : "";
-          console.info("[session/ws] done", { rootId: typeof payload?.root_id === "string" ? payload.root_id : null, sessionKey: sessionKey || null });
+          console.info("[session/ws] done", {
+            rootId:
+              typeof payload?.root_id === "string" ? payload.root_id : null,
+            sessionKey: sessionKey || null,
+          });
           const rootID =
             typeof payload?.root_id === "string" && payload.root_id
               ? payload.root_id
@@ -5931,7 +7831,10 @@ export function App({ onGoHome }: AppProps) {
             typeof payload?.session_key === "string" &&
             typeof payload?.root_id === "string"
           ) {
-            console.info("[session/ws] user_message", { rootId: payload.root_id, sessionKey: payload.session_key });
+            console.info("[session/ws] user_message", {
+              rootId: payload.root_id,
+              sessionKey: payload.session_key,
+            });
             const rootID = payload.root_id;
             const sessionKey = payload.session_key;
             const exchange = payload.exchange;
@@ -6131,7 +8034,8 @@ export function App({ onGoHome }: AppProps) {
           break;
         case "github.import": {
           const status = (payload?.status || {}) as any;
-          const taskID = typeof status?.task_id === "string" ? status.task_id : "";
+          const taskID =
+            typeof status?.task_id === "string" ? status.task_id : "";
           if (!taskID) {
             break;
           }
@@ -6156,7 +8060,8 @@ export function App({ onGoHome }: AppProps) {
           if (String(status?.status || "") === "done") {
             setProjectAddMode(null);
             void refreshManagedRoots();
-            const rootID = typeof status?.root_id === "string" ? status.root_id : "";
+            const rootID =
+              typeof status?.root_id === "string" ? status.root_id : "";
             if (rootID) {
               void actionHandlersRef.current.open_dir({
                 path: rootID,
@@ -6194,6 +8099,7 @@ export function App({ onGoHome }: AppProps) {
     refreshTreeDir,
     refreshCurrentFileContent,
     refreshGitStatus,
+    handleEnvironmentCommandEvent,
     refreshManagedRoots,
     updateSessionRelatedFilesForKey,
     treeCacheKey,
@@ -6488,7 +8394,12 @@ export function App({ onGoHome }: AppProps) {
 
     window.addEventListener("popstate", handlePopState);
     return () => window.removeEventListener("popstate", handlePopState);
-  }, [actionHandlers, loadSessionsForRoot, refreshTreeDir, tryShowBoundSessionForRoot]);
+  }, [
+    actionHandlers,
+    loadSessionsForRoot,
+    refreshTreeDir,
+    tryShowBoundSessionForRoot,
+  ]);
 
   const selectedRoot =
     (selectedSession?.root_id as string | undefined) || currentRootId || "";
@@ -6524,8 +8435,7 @@ export function App({ onGoHome }: AppProps) {
     selectedKey === activeBoundSessionKey &&
     interactionMode !== "drawer";
   const canOpenSessionDrawer = !!activeBoundSessionKey && !isBoundSessionInMain;
-  const detachedBoundSession =
-    isDetachedMainSessionTarget && !isDrawerOpen;
+  const detachedBoundSession = isDetachedMainSessionTarget && !isDrawerOpen;
 
   const matchedPlugin = useMemo(() => {
     if (!currentRootId || !file) return null;
@@ -6580,7 +8490,12 @@ export function App({ onGoHome }: AppProps) {
     const handleSelectionChange = () => {
       const root = pluginContentRef.current;
       const selection = window.getSelection();
-      if (!root || !selection || selection.rangeCount === 0 || selection.isCollapsed) {
+      if (
+        !root ||
+        !selection ||
+        selection.rangeCount === 0 ||
+        selection.isCollapsed
+      ) {
         handleViewerSelectionChange(null);
         return;
       }
@@ -6627,11 +8542,60 @@ export function App({ onGoHome }: AppProps) {
   }, [file, pluginBypass, pluginRender?.output, pluginQuery.chapter]);
 
   const pluginRendererKey = `${currentRootId || ""}:${file?.path || ""}:${fileCursorRef.current}:${JSON.stringify(pluginQuery)}`;
+  const currentEnvironmentCommandRun = currentRootId
+    ? environmentCommandRuns[currentRootId] || null
+    : null;
+  const showCommandLauncherButton = !isMobile;
   const showVSCodeButton = !isMobile && canLaunchVSCode();
-  const showTopbarVSCodeButton = showVSCodeButton && !!file;
-  const showSessionHeaderVSCodeButton = showVSCodeButton && !!selectedSession;
-  const showListHeaderVSCodeButton =
-    showVSCodeButton && !file && !selectedSession;
+  const showInlineTerminalButton = !isMobile;
+  const showSessionHeaderUtilityButtons =
+    !!selectedSession &&
+    (showCommandLauncherButton || showVSCodeButton || showInlineTerminalButton);
+  const showListHeaderUtilityButtons =
+    !file &&
+    !selectedSession &&
+    (showCommandLauncherButton || showVSCodeButton || showInlineTerminalButton);
+  const renderHeaderUtilityButtons = (variant: "subtle" | "panel" = "subtle") => (
+    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+      {showCommandLauncherButton ? (
+        <CommandLauncherButton
+          variant={variant}
+          disabled={
+            !currentRootId || environmentCommandBusy || environmentCommandsLoading
+          }
+          busy={environmentCommandBusy}
+          commands={environmentCommands}
+          onRunCommand={(command, options) => {
+            void handleRunEnvironmentCommand(command, options);
+          }}
+          onAddCommand={openCommandDialog}
+        />
+      ) : null}
+      {showVSCodeButton ? (
+        <ExternalLauncherButton
+          variant={variant}
+          disabled={!currentRootId || externalLaunchBusy}
+          busy={externalLaunchBusy}
+          hasFileTarget={!!file?.path}
+          onLaunch={(action) => {
+            void handleLaunchExternal(action);
+          }}
+        />
+      ) : null}
+      {showInlineTerminalButton ? (
+        <InlineTerminalButton
+          variant={variant}
+          disabled={!currentEnvironmentCommandRun}
+          active={currentEnvironmentCommandRun?.expanded === true}
+          onClick={() => {
+            if (currentRootId) {
+              openEnvironmentCommandPanel(currentRootId);
+            }
+          }}
+        />
+      ) : null}
+    </div>
+  );
   const pluginThemeVars = useMemo(() => {
     const theme = pluginRender?.plugin?.theme;
     if (!theme) return null;
@@ -6653,18 +8617,20 @@ export function App({ onGoHome }: AppProps) {
     } as React.CSSProperties;
   }, [pluginRender]);
 
-  const selectedSessionSnapshot = useMemo(
-    () => {
-      if (!selectedSession) {
-        return null;
-      }
-      return getSessionSnapshot(
-        selectedSession.root_id || currentRootId,
-        selectedSession,
-      );
-    },
-    [selectedSession, selectedSessionLoading, currentRootId, getSessionSnapshot],
-  );
+  const selectedSessionSnapshot = useMemo(() => {
+    if (!selectedSession) {
+      return null;
+    }
+    return getSessionSnapshot(
+      selectedSession.root_id || currentRootId,
+      selectedSession,
+    );
+  }, [
+    selectedSession,
+    selectedSessionLoading,
+    currentRootId,
+    getSessionSnapshot,
+  ]);
 
   useEffect(() => {
     const sessionKey =
@@ -6686,7 +8652,10 @@ export function App({ onGoHome }: AppProps) {
     if (!isStale && hasSessionExchanges(cached)) {
       return;
     }
-    if (!isStale && hasSessionExchanges(selectedSessionSnapshot as Session | null)) {
+    if (
+      !isStale &&
+      hasSessionExchanges(selectedSessionSnapshot as Session | null)
+    ) {
       return;
     }
     if (loadingSessionRef.current[cacheKey]) {
@@ -6771,11 +8740,10 @@ export function App({ onGoHome }: AppProps) {
         ((selectedSession?.root_id as string | undefined) || currentRootId) ===
           root &&
         (selectedSession?.key || selectedSession?.session_key) === boundKey
-          ? ((selectedSession as any) as { pending?: boolean })
+          ? (selectedSession as any as { pending?: boolean })
           : null;
       const pending =
-        (drawer?.key === boundKey && !!drawer?.pending) ||
-        !!selected?.pending;
+        (drawer?.key === boundKey && !!drawer?.pending) || !!selected?.pending;
       next[root] = { bound: true, pending };
     }
     return next;
@@ -6824,7 +8792,11 @@ export function App({ onGoHome }: AppProps) {
         resolvedRoot,
         resolvedKey,
       );
-      await setCachedSessionRelatedFiles(resolvedRoot, resolvedKey, relatedFiles);
+      await setCachedSessionRelatedFiles(
+        resolvedRoot,
+        resolvedKey,
+        relatedFiles,
+      );
       updateSessionRelatedFilesForKey(resolvedRoot, resolvedKey, relatedFiles);
     },
     [updateSessionRelatedFilesForKey],
@@ -6859,36 +8831,9 @@ export function App({ onGoHome }: AppProps) {
       targetSeq={selectedSession?.search_seq}
       loading={selectedSessionLoading}
       headerAction={
-        showSessionHeaderVSCodeButton ? (
-          <button
-            type="button"
-            onClick={() => {
-              void handleOpenInVSCode();
-            }}
-            disabled={!currentRootId || vscodeLaunching}
-            title="在 VS Code 中打开当前项目"
-            aria-label="在 VS Code 中打开当前项目"
-            style={{
-              width: "28px",
-              height: "28px",
-              borderRadius: "8px",
-              border: "none",
-              background: "transparent",
-              color: "var(--text-secondary)",
-              display: "inline-flex",
-              alignItems: "center",
-              justifyContent: "center",
-              cursor:
-                currentRootId && !vscodeLaunching ? "pointer" : "not-allowed",
-              opacity: currentRootId && !vscodeLaunching ? 1 : 0.5,
-              outline: "none",
-              padding: 0,
-              flexShrink: 0,
-            }}
-          >
-            <VSCodeIcon />
-          </button>
-        ) : null
+        showSessionHeaderUtilityButtons
+          ? renderHeaderUtilityButtons("subtle")
+          : null
       }
       rootId={selectedSession?.root_id || currentRootId}
       rootPath={
@@ -6952,9 +8897,13 @@ export function App({ onGoHome }: AppProps) {
           ))}
         </select>
         {worktreeBranchesLoading ? (
-          <span style={{ fontSize: "11px", color: "var(--text-secondary)" }}>加载分支中...</span>
+          <span style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
+            加载分支中...
+          </span>
         ) : worktreeBranchError ? (
-          <span style={{ fontSize: "11px", color: "#b45309" }}>{worktreeBranchError}</span>
+          <span style={{ fontSize: "11px", color: "#b45309" }}>
+            {worktreeBranchError}
+          </span>
         ) : null}
       </div>
     ) : null;
@@ -6976,7 +8925,13 @@ export function App({ onGoHome }: AppProps) {
           gap: "10px",
         }}
       >
-        <div style={{ fontSize: "12px", fontWeight: 600, color: "var(--text-primary)" }}>
+        <div
+          style={{
+            fontSize: "12px",
+            fontWeight: 600,
+            color: "var(--text-primary)",
+          }}
+        >
           worktree
         </div>
         <input
@@ -7009,24 +8964,28 @@ export function App({ onGoHome }: AppProps) {
         <div style={{ display: "flex" }}>
           <button
             type="button"
-            disabled={creatingRootBusy || !String(creatingRootName || "").trim()}
+            disabled={
+              creatingRootBusy || !String(creatingRootName || "").trim()
+            }
             onClick={() => {
               void handleCreateRootSubmit();
             }}
             style={{
               width: "100%",
               border: "none",
-              background: creatingRootBusy || !String(creatingRootName || "").trim()
-                ? "rgba(59, 130, 246, 0.65)"
-                : "var(--accent-color)",
+              background:
+                creatingRootBusy || !String(creatingRootName || "").trim()
+                  ? "rgba(59, 130, 246, 0.65)"
+                  : "var(--accent-color)",
               color: "#fff",
               borderRadius: "8px",
               padding: "8px 10px",
               fontSize: "12px",
               fontWeight: 600,
-              cursor: creatingRootBusy || !String(creatingRootName || "").trim()
-                ? "not-allowed"
-                : "pointer",
+              cursor:
+                creatingRootBusy || !String(creatingRootName || "").trim()
+                  ? "not-allowed"
+                  : "pointer",
             }}
           >
             {creatingRootBusy ? "处理中..." : "创建"}
@@ -7037,11 +8996,16 @@ export function App({ onGoHome }: AppProps) {
 
   let workspaceView: React.ReactNode;
   const gitStatusAvailable = filteredGitStatus?.available === true;
-  const gitHistoryExpandedCommits = currentRootId ? gitHistoryExpandedByRoot[currentRootId] || {} : {};
+  const gitHistoryExpandedCommits = currentRootId
+    ? gitHistoryExpandedByRoot[currentRootId] || {}
+    : {};
   const currentRootDisplayName = currentRootId
-    ? managedRootByIdRef.current[currentRootId]?.display_name
-      || managedRootByIdRef.current[currentRootId]?.root_path?.split(/[/\\]/).filter(Boolean).pop()
-      || currentRootId
+    ? managedRootByIdRef.current[currentRootId]?.display_name ||
+      managedRootByIdRef.current[currentRootId]?.root_path
+        ?.split(/[/\\]/)
+        .filter(Boolean)
+        .pop() ||
+      currentRootId
     : undefined;
   if (gitDiff) {
     workspaceView = (
@@ -7202,6 +9166,11 @@ export function App({ onGoHome }: AppProps) {
           ) : null}
           <FileViewer
             file={file}
+            headerAction={
+              showCommandLauncherButton || showVSCodeButton
+                ? renderHeaderUtilityButtons("subtle")
+                : null
+            }
             isVisible={!selectedSession}
             onSelectionChange={handleViewerSelectionChange}
             initialScrollTop={
@@ -7232,38 +9201,7 @@ export function App({ onGoHome }: AppProps) {
         entries={visibleMainEntries}
         errorMessage={mainDirectoryError}
         headerAction={
-          showListHeaderVSCodeButton ? (
-            <button
-              type="button"
-              onClick={() => {
-                void handleOpenInVSCode();
-              }}
-              disabled={!currentRootId || vscodeLaunching}
-              title="在 VS Code 中打开当前项目"
-              aria-label="在 VS Code 中打开当前项目"
-              style={{
-                width: "28px",
-                height: "28px",
-                borderRadius: "8px",
-                border: "none",
-                background: "transparent",
-                color: "var(--text-secondary)",
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-                cursor:
-                  currentRootId && !vscodeLaunching
-                    ? "pointer"
-                    : "not-allowed",
-                opacity:
-                  currentRootId && !vscodeLaunching ? 1 : 0.5,
-                outline: "none",
-                padding: 0,
-              }}
-            >
-              <VSCodeIcon />
-            </button>
-          ) : null
+          showListHeaderUtilityButtons ? renderHeaderUtilityButtons("subtle") : null
         }
         showHiddenFiles={showHiddenFiles}
         sortMode={currentDirectorySortMode}
@@ -7288,8 +9226,13 @@ export function App({ onGoHome }: AppProps) {
         }}
         onUploadFiles={handleTreeUpload}
         onRemoveRoot={handleRemoveCurrentRoot}
-        isGitRepo={managedRootByIdRef.current[currentRootId || ""]?.is_git_repo === true}
-        isGitWorktree={managedRootByIdRef.current[currentRootId || ""]?.is_git_worktree === true}
+        isGitRepo={
+          managedRootByIdRef.current[currentRootId || ""]?.is_git_repo === true
+        }
+        isGitWorktree={
+          managedRootByIdRef.current[currentRootId || ""]?.is_git_worktree ===
+          true
+        }
         onCreateWorktree={handleOpenWorktreeLocation}
         onRemoveWorktree={handleRemoveCurrentWorktree}
         menuOverlay={
@@ -7637,7 +9580,7 @@ export function App({ onGoHome }: AppProps) {
             ? "未找到匹配会话"
             : sessionSearchOpen
               ? ""
-            : "暂无会话记录"
+              : "暂无会话记录"
         }
         onSearchToggle={() => {
           setSessionSearchOpen((prev) => {
@@ -7733,6 +9676,7 @@ export function App({ onGoHome }: AppProps) {
               void handleCreateRootSubmit();
             }}
             onCreateRootCancel={handleCreateRootCancel}
+            onCollapseAll={() => setExpanded([])}
             projectAddOverlay={
               projectAddMode === "worktree_location" ? null : projectAddOverlay
             }
@@ -7774,7 +9718,11 @@ export function App({ onGoHome }: AppProps) {
             gitHistoryExpandedCommits={gitHistoryExpandedCommits}
             rootId={currentRootId || undefined}
             rootName={currentRootDisplayName}
-            showGit={!!currentRootId && (filteredGitStatus?.available === true || gitHistory?.available === true)}
+            showGit={
+              !!currentRootId &&
+              (filteredGitStatus?.available === true ||
+                gitHistory?.available === true)
+            }
             onSelectGitItem={(item) => {
               const root = currentRootIdRef.current;
               if (!root) return;
@@ -7868,40 +9816,6 @@ export function App({ onGoHome }: AppProps) {
                     pointerEvents: "none",
                   }}
                 >
-                  {showTopbarVSCodeButton ? (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        void handleOpenInVSCode();
-                      }}
-                      disabled={!currentRootId || vscodeLaunching}
-                      title={
-                        file?.path
-                          ? "在 VS Code 中打开当前项目并定位文件"
-                          : "在 VS Code 中打开当前项目"
-                      }
-                      style={{
-                        pointerEvents: "auto",
-                        background: "var(--content-bg)",
-                        border: "1px solid var(--border-color)",
-                        borderRadius: "8px",
-                        width: "32px",
-                        height: "32px",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        cursor:
-                          currentRootId && !vscodeLaunching
-                            ? "pointer"
-                            : "not-allowed",
-                        opacity:
-                          currentRootId && !vscodeLaunching ? 1 : 0.5,
-                        color: "var(--text-secondary)",
-                      }}
-                    >
-                      <VSCodeIcon />
-                    </button>
-                  ) : null}
                   <button
                     onClick={() => setIsRightOpen(!isRightOpen)}
                     style={{
@@ -7954,6 +9868,13 @@ export function App({ onGoHome }: AppProps) {
               >
                 {workspaceView}
               </div>
+              <EnvironmentCommandTerminalPanel
+                run={currentEnvironmentCommandRun}
+                onToggleExpanded={() =>
+                  toggleEnvironmentCommandPanel(currentRootId || "")
+                }
+                onClear={() => clearEnvironmentCommandPanel(currentRootId || "")}
+              />
             </div>
           </div>
         }
@@ -7968,7 +9889,10 @@ export function App({ onGoHome }: AppProps) {
               root_path: managedRootByIdRef.current[id]?.root_path,
             }))}
             currentBranch={gitStatus?.branch}
-            isGitRepo={managedRootByIdRef.current[currentRootId || ""]?.is_git_repo === true}
+            isGitRepo={
+              managedRootByIdRef.current[currentRootId || ""]?.is_git_repo ===
+              true
+            }
             currentSession={actionBarSession}
             attachedFileContext={attachedFileContext}
             canOpenSessionDrawer={canOpenSessionDrawer}
@@ -7981,7 +9905,11 @@ export function App({ onGoHome }: AppProps) {
             onToggleLeftSidebar={() => setIsLeftOpen((v) => !v)}
             onToggleRightSidebar={() => setIsRightOpen((v) => !v)}
             onSwitchRoot={(rootId) => {
-              void actionHandlers.open_dir({ path: rootId, root: rootId, isRoot: true });
+              void actionHandlers.open_dir({
+                path: rootId,
+                root: rootId,
+                isRoot: true,
+              });
               if (isMobile) setIsLeftOpen(false);
             }}
             onCheckoutBranch={async (branch) => {
@@ -8047,7 +9975,8 @@ export function App({ onGoHome }: AppProps) {
                 onRemoveRelatedFile={(path) =>
                   void handleRemoveSessionRelatedFile(
                     currentRootId,
-                    drawerSessionSnapshot?.key || drawerSessionSnapshot?.session_key,
+                    drawerSessionSnapshot?.key ||
+                      drawerSessionSnapshot?.session_key,
                     path,
                   )
                 }
@@ -8085,12 +10014,14 @@ export function App({ onGoHome }: AppProps) {
               flexDirection: "column",
               gap: "14px",
             }}
-	          >
-	            <div style={{ fontSize: "20px", fontWeight: 700, color: "#0f172a" }}>
-	              端到端配对码
-	            </div>
-	            <input
-	              type="text"
+          >
+            <div
+              style={{ fontSize: "20px", fontWeight: 700, color: "#0f172a" }}
+            >
+              端到端配对码
+            </div>
+            <input
+              type="text"
               value={e2eeSecretInput}
               onChange={(event) => {
                 setE2eeSecretInput(event.target.value);
@@ -8103,7 +10034,7 @@ export function App({ onGoHome }: AppProps) {
                   void submitE2EESecret();
                 }
               }}
-	              placeholder="输入终端中显示的端到端配对码"
+              placeholder="输入终端中显示的端到端配对码"
               autoFocus
               spellCheck={false}
               style={{
@@ -8120,7 +10051,13 @@ export function App({ onGoHome }: AppProps) {
                 {e2eePromptError}
               </div>
             ) : null}
-            <div style={{ display: "flex", justifyContent: "space-between", gap: "12px" }}>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                gap: "12px",
+              }}
+            >
               <button
                 type="button"
                 onClick={() => {
@@ -8157,6 +10094,20 @@ export function App({ onGoHome }: AppProps) {
           </div>
         </div>
       ) : null}
+      <AddCommandDialog
+        open={commandDialogOpen}
+        busy={environmentCommandBusy}
+        error={commandDialogError}
+        value={commandForm}
+        onChange={setCommandForm}
+        onClose={() => {
+          if (!environmentCommandBusy) {
+            setCommandDialogOpen(false);
+            setCommandDialogError("");
+          }
+        }}
+        onSubmit={handleSaveEnvironmentCommand}
+      />
       <ToastContainer />
     </>
   );

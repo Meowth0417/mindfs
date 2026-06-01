@@ -18,6 +18,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	agenttypes "mindfs/server/internal/agent/types"
 	"mindfs/server/internal/fs"
 
 	_ "modernc.org/sqlite"
@@ -280,15 +281,15 @@ func (m *Manager) Search(_ context.Context, opts SearchOptions) ([]SearchHit, er
 	return results, nil
 }
 
-func (m *Manager) AddExchangeForAgent(_ context.Context, session *Session, role, content, agent, mode, effort, fastService string) error {
-	return m.addExchangeForAgentAt(session, role, content, agent, mode, effort, fastService, time.Time{})
+func (m *Manager) AddExchangeForAgent(_ context.Context, session *Session, role, content, agent, mode, effort, fastService string, contextWindow *agenttypes.ContextWindow) error {
+	return m.addExchangeForAgentAt(session, role, content, agent, mode, effort, fastService, contextWindow, time.Time{})
 }
 
-func (m *Manager) AddExchangeForAgentAt(_ context.Context, session *Session, role, content, agent, mode, effort, fastService string, timestamp time.Time) error {
-	return m.addExchangeForAgentAt(session, role, content, agent, mode, effort, fastService, timestamp)
+func (m *Manager) AddExchangeForAgentAt(_ context.Context, session *Session, role, content, agent, mode, effort, fastService string, contextWindow *agenttypes.ContextWindow, timestamp time.Time) error {
+	return m.addExchangeForAgentAt(session, role, content, agent, mode, effort, fastService, contextWindow, timestamp)
 }
 
-func (m *Manager) addExchangeForAgentAt(session *Session, role, content, agent, mode, effort, fastService string, timestamp time.Time) error {
+func (m *Manager) addExchangeForAgentAt(session *Session, role, content, agent, mode, effort, fastService string, contextWindow *agenttypes.ContextWindow, timestamp time.Time) error {
 	if session == nil || strings.TrimSpace(session.Key) == "" {
 		return errors.New("session required")
 	}
@@ -313,15 +314,16 @@ func (m *Manager) addExchangeForAgentAt(session *Session, role, content, agent, 
 		ts = m.now().UTC()
 	}
 	record := Exchange{
-		Seq:         nextSeq,
-		Role:        role,
-		Agent:       resolvedAgent,
-		Model:       session.Model,
-		Mode:        strings.TrimSpace(mode),
-		Effort:      strings.TrimSpace(effort),
-		FastService: fastService,
-		Content:     content,
-		Timestamp:   ts,
+		Seq:           nextSeq,
+		Role:          role,
+		Agent:         resolvedAgent,
+		Model:         session.Model,
+		Mode:          strings.TrimSpace(mode),
+		Effort:        strings.TrimSpace(effort),
+		FastService:   fastService,
+		Content:       content,
+		ContextWindow: cloneContextWindow(contextWindow),
+		Timestamp:     ts,
 	}
 	if err := m.appendExchange(session.Key, record); err != nil {
 		log.Printf("[session/store] append.error session=%s seq=%d role=%s agent=%s err=%v", session.Key, record.Seq, role, resolvedAgent, err)
@@ -341,6 +343,22 @@ func (m *Manager) addExchangeForAgentAt(session *Session, role, content, agent, 
 		return err
 	}
 	return nil
+}
+
+func cloneContextWindow(contextWindow *agenttypes.ContextWindow) *agenttypes.ContextWindow {
+	if contextWindow == nil {
+		return nil
+	}
+	totalTokens := contextWindow.TotalTokens
+	modelContextWindow := contextWindow.ModelContextWindow
+	if totalTokens <= 0 || modelContextWindow <= 0 {
+		return nil
+	}
+	cloned := &agenttypes.ContextWindow{
+		TotalTokens:        totalTokens,
+		ModelContextWindow: modelContextWindow,
+	}
+	return cloned
 }
 
 func (m *Manager) AddExchangeAux(_ context.Context, sessionKey string, aux ExchangeAux) error {

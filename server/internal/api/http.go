@@ -242,6 +242,9 @@ func (h *HTTPHandler) Routes() http.Handler {
 	r.Get("/api/tree", h.protectedEndpoint(h.handleTree))
 	r.Get("/api/file", h.handleFile)
 	r.Post("/api/vscode/open", h.protectedEndpoint(h.handleVSCodeOpen))
+	r.Get("/api/environment/commands", h.protectedEndpoint(h.handleEnvironmentCommandsList))
+	r.Post("/api/environment/commands", h.protectedEndpoint(h.handleEnvironmentCommandSave))
+	r.Post("/api/environment/commands/run", h.protectedEndpoint(h.handleEnvironmentCommandRun))
 	r.Get("/api/git/status", h.protectedEndpoint(h.handleGitStatus))
 	r.Get("/api/git/diff", h.protectedEndpoint(h.handleGitDiff))
 	r.Get("/api/git/history", h.protectedEndpoint(h.handleGitHistory))
@@ -691,6 +694,7 @@ func sessionResponse(
 		}
 		auxPayload[strconv.Itoa(seq)] = append([]session.ExchangeAux(nil), items...)
 	}
+	payloadContextWindow := sessionContextWindowPayload(s, contextWindow)
 	return map[string]any{
 		"key":            s.Key,
 		"type":           s.Type,
@@ -703,7 +707,7 @@ func sessionResponse(
 		"exchanges":      exchanges,
 		"exchange_aux":   auxPayload,
 		"related_files":  s.RelatedFiles,
-		"context_window": contextWindow,
+		"context_window": payloadContextWindow,
 		"created_at":     s.CreatedAt,
 		"updated_at":     s.UpdatedAt,
 		"closed_at":      s.ClosedAt,
@@ -714,19 +718,40 @@ func sessionListResponse(s *session.Session) map[string]any {
 	if s == nil {
 		return map[string]any{}
 	}
+	payloadContextWindow := sessionContextWindowPayload(s, agenttypes.ContextWindow{})
 	return map[string]any{
-		"key":          s.Key,
-		"type":         s.Type,
-		"agent":        session.InferAgentFromSession(s),
-		"model":        s.Model,
-		"mode":         session.InferModeFromSession(s),
-		"effort":       session.InferEffortFromSession(s),
-		"fast_service": session.InferFastServiceFromSession(s),
-		"name":         s.Name,
-		"created_at":   s.CreatedAt,
-		"updated_at":   s.UpdatedAt,
-		"closed_at":    s.ClosedAt,
+		"key":            s.Key,
+		"type":           s.Type,
+		"agent":          session.InferAgentFromSession(s),
+		"model":          s.Model,
+		"mode":           session.InferModeFromSession(s),
+		"effort":         session.InferEffortFromSession(s),
+		"fast_service":   session.InferFastServiceFromSession(s),
+		"name":           s.Name,
+		"context_window": payloadContextWindow,
+		"created_at":     s.CreatedAt,
+		"updated_at":     s.UpdatedAt,
+		"closed_at":      s.ClosedAt,
 	}
+}
+
+func sessionContextWindowPayload(s *session.Session, live agenttypes.ContextWindow) agenttypes.ContextWindow {
+	if live.TotalTokens > 0 && live.ModelContextWindow > 0 {
+		return live
+	}
+	if s == nil {
+		return agenttypes.ContextWindow{}
+	}
+	for i := len(s.Exchanges) - 1; i >= 0; i-- {
+		candidate := s.Exchanges[i].ContextWindow
+		if candidate == nil {
+			continue
+		}
+		if candidate.TotalTokens > 0 && candidate.ModelContextWindow > 0 {
+			return *candidate
+		}
+	}
+	return agenttypes.ContextWindow{}
 }
 
 func externalSessionListResponse(s agenttypes.ExternalSessionSummary) map[string]any {
@@ -1177,6 +1202,7 @@ func (h *HTTPHandler) handleVSCodeOpen(w http.ResponseWriter, r *http.Request) {
 		Path   string `json:"path"`
 		Line   int    `json:"line"`
 		Column int    `json:"column"`
+		Action string `json:"action"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid json body"))
@@ -1184,8 +1210,15 @@ func (h *HTTPHandler) handleVSCodeOpen(w http.ResponseWriter, r *http.Request) {
 	}
 	req.RootID = strings.TrimSpace(req.RootID)
 	req.Path = strings.TrimSpace(req.Path)
+	req.Action = strings.TrimSpace(req.Action)
 	if req.RootID == "" {
 		respondError(w, http.StatusBadRequest, errInvalidRequest("root required"))
+		return
+	}
+	switch req.Action {
+	case "", "vscode", "explorer", "powershell":
+	default:
+		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid action"))
 		return
 	}
 	uc := h.service()
@@ -1194,6 +1227,7 @@ func (h *HTTPHandler) handleVSCodeOpen(w http.ResponseWriter, r *http.Request) {
 		Path:   req.Path,
 		Line:   req.Line,
 		Column: req.Column,
+		Action: req.Action,
 	})
 	if err != nil {
 		respondJSON(w, http.StatusConflict, map[string]any{
@@ -1203,6 +1237,143 @@ func (h *HTTPHandler) handleVSCodeOpen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respondJSON(w, http.StatusOK, out)
+}
+
+func (h *HTTPHandler) handleEnvironmentCommandsList(w http.ResponseWriter, r *http.Request) {
+	rootID := strings.TrimSpace(r.URL.Query().Get("root"))
+	if rootID == "" {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("root required"))
+		return
+	}
+	out, err := h.service().ListEnvironmentCommands(r.Context(), usecase.ListEnvironmentCommandsInput{
+		RootID: rootID,
+	})
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, out)
+}
+
+func (h *HTTPHandler) handleEnvironmentCommandSave(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Root       string `json:"root"`
+		Name       string `json:"name"`
+		Icon       string `json:"icon"`
+		Command    string `json:"command"`
+		SetDefault bool   `json:"set_default"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid json body"))
+		return
+	}
+	out, err := h.service().SaveEnvironmentCommand(r.Context(), usecase.SaveEnvironmentCommandInput{
+		RootID:     strings.TrimSpace(req.Root),
+		Name:       req.Name,
+		Icon:       req.Icon,
+		Command:    req.Command,
+		SetDefault: req.SetDefault,
+	})
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, out)
+}
+
+func (h *HTTPHandler) handleEnvironmentCommandRun(w http.ResponseWriter, r *http.Request) {
+	if !isLoopbackRequest(r) {
+		respondError(w, http.StatusForbidden, errInvalidRequest("command launch is only available on local connections"))
+		return
+	}
+	var req struct {
+		Root        string `json:"root"`
+		CommandID   string `json:"command_id"`
+		MakeDefault bool   `json:"make_default"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid json body"))
+		return
+	}
+	out, err := h.service().RunEnvironmentCommand(r.Context(), usecase.RunEnvironmentCommandInput{
+		RootID:      strings.TrimSpace(req.Root),
+		CommandID:   strings.TrimSpace(req.CommandID),
+		MakeDefault: req.MakeDefault,
+	})
+	if err != nil {
+		respondJSON(w, http.StatusConflict, map[string]any{
+			"error":   "command_run_failed",
+			"message": err.Error(),
+		})
+		return
+	}
+	clientID := strings.TrimSpace(r.Header.Get(clientIDHeaderName))
+	runner := h.AppContext.GetEnvironmentCommandRunner()
+	run, err := runner.Start(usecase.StartEnvironmentCommandRunInput{
+		ClientID:  clientID,
+		RootID:    strings.TrimSpace(req.Root),
+		CommandID: out.ID,
+		Name:      out.Name,
+		Command:   out.Command,
+		Target:    out.Target,
+		OnEvent: func(event usecase.EnvironmentCommandRunEvent) {
+			h.emitEnvironmentCommandEvent(clientID, event)
+		},
+	})
+	if err != nil {
+		respondJSON(w, http.StatusConflict, map[string]any{
+			"error":   "command_run_failed",
+			"message": err.Error(),
+		})
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{
+		"id":         out.ID,
+		"name":       out.Name,
+		"command":    out.Command,
+		"target":     out.Target,
+		"action":     out.Action,
+		"run_id":     run.RunID,
+		"root_id":    run.RootID,
+		"status":     run.Status,
+		"started_at": run.StartedAt,
+	})
+}
+
+func (h *HTTPHandler) emitEnvironmentCommandEvent(clientID string, event usecase.EnvironmentCommandRunEvent) {
+	if h == nil || h.AppContext == nil || h.AppContext.GetSessionStreamHub() == nil {
+		return
+	}
+	payload := map[string]any{
+		"root_id":     event.Run.RootID,
+		"run_id":      event.Run.RunID,
+		"command_id":  event.Run.CommandID,
+		"name":        event.Run.Name,
+		"command":     event.Run.Command,
+		"target":      event.Run.Target,
+		"status":      event.Run.Status,
+		"started_at":  event.Run.StartedAt,
+		"finished_at": event.Run.FinishedAt,
+		"exit_code":   event.Run.ExitCode,
+	}
+	if event.Stream != "" {
+		payload["stream"] = event.Stream
+	}
+	if event.Chunk != "" {
+		payload["chunk"] = event.Chunk
+	}
+	if event.Error != "" {
+		payload["error"] = event.Error
+	}
+	resp := WSResponse{
+		Type: "environment.command." + event.Type,
+		Payload: payload,
+	}
+	if strings.TrimSpace(clientID) != "" {
+		h.AppContext.GetSessionStreamHub().SendToClient(clientID, resp)
+		return
+	}
+	h.AppContext.GetSessionStreamHub().BroadcastAll(resp)
 }
 
 func (h *HTTPHandler) handleGitStatus(w http.ResponseWriter, r *http.Request) {

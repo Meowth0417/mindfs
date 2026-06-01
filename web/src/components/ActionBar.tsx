@@ -21,6 +21,16 @@ type SessionInfo = {
   mode?: string;
   effort?: string;
   fast_service?: string;
+  context_window?: {
+    totalTokens: number;
+    modelContextWindow: number;
+  };
+  exchanges?: Array<{
+    context_window?: {
+      totalTokens: number;
+      modelContextWindow: number;
+    };
+  }>;
   pending?: boolean;
 };
 
@@ -45,6 +55,97 @@ function getSelectionPreview(text?: string): string {
     return "...";
   }
   return `${Array.from(trimmed).slice(0, 3).join("")}...`;
+}
+
+function getContextWindowMetrics(contextWindow?: {
+  totalTokens?: number;
+  modelContextWindow?: number;
+}) {
+  const usedTokens = Math.max(0, Number(contextWindow?.totalTokens || 0));
+  const modelContextWindow = Math.max(
+    0,
+    Number(contextWindow?.modelContextWindow || 0),
+  );
+  if (!usedTokens || !modelContextWindow) {
+    return null;
+  }
+  const usedRatio = Math.max(0, Math.min(1, usedTokens / modelContextWindow));
+  const percent = Math.round(usedRatio * 100);
+  const color =
+    percent >= 90 ? "#dc2626" : percent >= 75 ? "#ea580c" : "#0f766e";
+  return { usedTokens, modelContextWindow, percent, color };
+}
+
+function resolveContextWindow(
+  session?: SessionInfo | null,
+): { totalTokens: number; modelContextWindow: number } | undefined {
+  const topLevel = getContextWindowMetrics(session?.context_window)
+    ? session?.context_window
+    : undefined;
+  if (topLevel) {
+    return topLevel;
+  }
+  const exchanges = Array.isArray(session?.exchanges) ? session.exchanges : [];
+  for (let i = exchanges.length - 1; i >= 0; i -= 1) {
+    const candidate = exchanges[i]?.context_window;
+    if (getContextWindowMetrics(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+function ContextWindowUsageBadge({
+  contextWindow,
+}: {
+  contextWindow?: {
+    totalTokens?: number;
+    modelContextWindow?: number;
+  };
+}) {
+  const metrics = getContextWindowMetrics(contextWindow);
+  if (!metrics) {
+    return null;
+  }
+  return (
+    <span
+      title={`Context Window ${metrics.percent}% used (${metrics.usedTokens}/${metrics.modelContextWindow} used)`}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: "6px",
+        minWidth: 0,
+        color: metrics.color,
+        fontSize: "12px",
+        fontWeight: 600,
+        whiteSpace: "nowrap",
+      }}
+    >
+      <svg
+        width="14"
+        height="14"
+        viewBox="0 0 24 24"
+        fill="none"
+        aria-hidden="true"
+        style={{ flexShrink: 0 }}
+      >
+        <path
+          d="M4 12a8 8 0 1 1 4.1 6.98"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+        />
+        <path
+          d="M12 12 16.5 8.5"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+        />
+        <circle cx="12" cy="12" r="1.5" fill="currentColor" />
+      </svg>
+      <span>{metrics.percent}% used</span>
+    </span>
+  );
 }
 
 type RootEntry = {
@@ -945,7 +1046,25 @@ export function ActionBar({
             </button>
           ) : null}
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: "6px", padding: isMobile ? "4px 4px 0" : "2px 0 0" }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "12px",
+            padding: isMobile ? "4px 4px 0" : "2px 0 0",
+            minWidth: 0,
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              minWidth: 0,
+              flex: 1,
+            }}
+          >
             {/* 项目切换下拉 */}
             <div style={{ position: "relative", flexShrink: 0, maxWidth: isMobile ? "55vw" : "280px" }}>
             <button
@@ -1175,6 +1294,22 @@ export function ActionBar({
               </div>
             ) : null}
           </div>
+          {!isMobile ? (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "flex-end",
+                minWidth: 0,
+                flexShrink: 0,
+              }}
+            >
+              <ContextWindowUsageBadge
+                contextWindow={resolveContextWindow(currentSession)}
+              />
+            </div>
+          ) : null}
+        </div>
         {attachedFileContext ? (
           <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", padding: isMobile ? "6px 4px 0" : "0 4px" }}>
             <span

@@ -11,13 +11,16 @@ export function canLaunchVSCode(): boolean {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
 }
 
+export type ExternalLaunchAction = "vscode" | "explorer" | "powershell";
+
 export async function launchVSCode(input: {
   rootId: string;
   path?: string;
   line?: number;
   column?: number;
-}): Promise<{ mode: string; target: string }> {
-  return protectedJSON<{ mode: string; target: string }>(appURL("/api/vscode/open"), {
+  action?: ExternalLaunchAction;
+}): Promise<{ mode: string; target: string; action: ExternalLaunchAction }> {
+  return protectedJSON<{ mode: string; target: string; action: ExternalLaunchAction }>(appURL("/api/vscode/open"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -25,6 +28,7 @@ export async function launchVSCode(input: {
       path: input.path || "",
       line: input.line || 0,
       column: input.column || 0,
+      action: input.action || "vscode",
     }),
   });
 }

@@ -17,11 +17,13 @@ type LaunchVSCodeInput struct {
 	Path   string
 	Line   int
 	Column int
+	Action string
 }
 
 type LaunchVSCodeOutput struct {
 	Mode   string `json:"mode"`
 	Target string `json:"target"`
+	Action string `json:"action"`
 }
 
 func (s *Service) LaunchVSCode(ctx context.Context, in LaunchVSCodeInput) (LaunchVSCodeOutput, error) {
@@ -36,6 +38,7 @@ func (s *Service) LaunchVSCode(ctx context.Context, in LaunchVSCodeInput) (Launc
 	if err != nil {
 		return LaunchVSCodeOutput{}, err
 	}
+	action := normalizeLaunchAction(in.Action)
 
 	targetAbs := rootAbs
 	targetFileAbs := ""
@@ -51,11 +54,18 @@ func (s *Service) LaunchVSCode(ctx context.Context, in LaunchVSCodeInput) (Launc
 		targetAbs = targetFileAbs
 	}
 
+	switch action {
+	case "explorer":
+		return launchSystemFileManager(ctx, rootAbs, targetFileAbs)
+	case "powershell":
+		return launchPowerShellTerminal(ctx, rootAbs, targetFileAbs)
+	}
+
 	if cmdPath, args, ok := resolveVSCodeCLI(rootAbs, targetFileAbs, in.Line, in.Column); ok {
-		cmd := exec.CommandContext(ctx, cmdPath, args...)
+		cmd := exec.Command(cmdPath, args...)
 		if err := cmd.Start(); err == nil {
 			_ = cmd.Process.Release()
-			return LaunchVSCodeOutput{Mode: "cli", Target: targetAbs}, nil
+			return LaunchVSCodeOutput{Mode: "cli", Target: targetAbs, Action: action}, nil
 		}
 	}
 
@@ -66,7 +76,18 @@ func (s *Service) LaunchVSCode(ctx context.Context, in LaunchVSCodeInput) (Launc
 	if err := openExternalURL(ctx, targetURI); err != nil {
 		return LaunchVSCodeOutput{}, err
 	}
-	return LaunchVSCodeOutput{Mode: "uri", Target: targetAbs}, nil
+	return LaunchVSCodeOutput{Mode: "uri", Target: targetAbs, Action: action}, nil
+}
+
+func normalizeLaunchAction(input string) string {
+	switch strings.ToLower(strings.TrimSpace(input)) {
+	case "explorer":
+		return "explorer"
+	case "powershell":
+		return "powershell"
+	default:
+		return "vscode"
+	}
 }
 
 func resolveVSCodeCLI(rootAbs, targetFileAbs string, line, column int) (string, []string, bool) {
@@ -102,6 +123,10 @@ func findVSCodeCLI() string {
 			filepath.Join(os.Getenv("ProgramFiles(x86)"), "Microsoft VS Code", "Code.exe"),
 		)
 	}
+	return findExistingExecutable(candidates)
+}
+
+func findExistingExecutable(candidates []string) string {
 	for _, candidate := range candidates {
 		if strings.TrimSpace(candidate) == "" {
 			continue
@@ -117,6 +142,32 @@ func findVSCodeCLI() string {
 		}
 	}
 	return ""
+}
+
+func findPowerShellExecutable() string {
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+	candidates := []string{
+		"powershell.exe",
+		filepath.Join(os.Getenv("SystemRoot"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+		"pwsh.exe",
+		filepath.Join(os.Getenv("ProgramFiles"), "PowerShell", "7", "pwsh.exe"),
+		filepath.Join(os.Getenv("ProgramFiles"), "PowerShell", "6", "pwsh.exe"),
+		filepath.Join(os.Getenv("LOCALAPPDATA"), "Microsoft", "WindowsApps", "pwsh.exe"),
+	}
+	return findExistingExecutable(candidates)
+}
+
+func findWindowsPowerShellHost() string {
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+	candidates := []string{
+		"powershell.exe",
+		filepath.Join(os.Getenv("SystemRoot"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+	}
+	return findExistingExecutable(candidates)
 }
 
 func buildVSCodeURI(targetAbs string) string {
@@ -135,15 +186,101 @@ func buildVSCodeURI(targetAbs string) string {
 	}).String()
 }
 
-func openExternalURL(ctx context.Context, rawURL string) error {
+func launchSystemFileManager(_ context.Context, rootAbs, targetFileAbs string) (LaunchVSCodeOutput, error) {
+	targetAbs := rootAbs
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		cmd = exec.CommandContext(ctx, "rundll32", "url.dll,FileProtocolHandler", rawURL)
+		if targetFileAbs != "" {
+			targetAbs = targetFileAbs
+			cmd = exec.Command("explorer.exe", "/select,", targetFileAbs)
+		} else {
+			cmd = exec.Command("explorer.exe", rootAbs)
+		}
 	case "darwin":
-		cmd = exec.CommandContext(ctx, "open", rawURL)
+		if targetFileAbs != "" {
+			targetAbs = targetFileAbs
+			cmd = exec.Command("open", "-R", targetFileAbs)
+		} else {
+			cmd = exec.Command("open", rootAbs)
+		}
 	default:
-		cmd = exec.CommandContext(ctx, "xdg-open", rawURL)
+		if targetFileAbs != "" {
+			targetAbs = filepath.Dir(targetFileAbs)
+		}
+		cmd = exec.Command("xdg-open", targetAbs)
+	}
+	if err := cmd.Start(); err != nil {
+		return LaunchVSCodeOutput{}, err
+	}
+	_ = cmd.Process.Release()
+	return LaunchVSCodeOutput{
+		Mode:   "explorer",
+		Target: targetAbs,
+		Action: "explorer",
+	}, nil
+}
+
+func launchPowerShellTerminal(_ context.Context, rootAbs, targetFileAbs string) (LaunchVSCodeOutput, error) {
+	if runtime.GOOS != "windows" {
+		return LaunchVSCodeOutput{}, errors.New("powershell launch is only available on Windows")
+	}
+	workingDir := rootAbs
+	if targetFileAbs != "" {
+		workingDir = filepath.Dir(targetFileAbs)
+	}
+	executable := findPowerShellExecutable()
+	if executable == "" {
+		return LaunchVSCodeOutput{}, errors.New("unable to find PowerShell executable")
+	}
+	script := "Set-Location -LiteralPath '" + escapePowerShellLiteral(workingDir) + "'"
+	args := []string{
+		"-NoLogo",
+		"-NoExit",
+		"-Command",
+		script,
+	}
+	if err := startDetachedWindowsProcess(executable, workingDir, args); err != nil {
+		return LaunchVSCodeOutput{}, err
+	}
+	return LaunchVSCodeOutput{
+		Mode:   "powershell",
+		Target: workingDir,
+		Action: "powershell",
+	}, nil
+}
+
+func escapePowerShellLiteral(input string) string {
+	return strings.ReplaceAll(input, "'", "''")
+}
+
+func quotePowerShellLiteral(input string) string {
+	return "'" + escapePowerShellLiteral(input) + "'"
+}
+
+func buildWindowsStartProcessScript(executable, workingDir string, args []string) string {
+	quotedArgs := make([]string, 0, len(args))
+	for _, arg := range args {
+		quotedArgs = append(quotedArgs, quotePowerShellLiteral(arg))
+	}
+	return "$ErrorActionPreference = 'Stop'; Start-Process -FilePath " +
+		quotePowerShellLiteral(executable) +
+		" -WorkingDirectory " +
+		quotePowerShellLiteral(workingDir) +
+		" -ArgumentList @(" +
+		strings.Join(quotedArgs, ", ") +
+		") | Out-Null"
+}
+
+func openExternalURL(_ context.Context, rawURL string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", rawURL)
+	case "darwin":
+		cmd = exec.Command("open", rawURL)
+	default:
+		cmd = exec.Command("xdg-open", rawURL)
 	}
 	if err := cmd.Start(); err != nil {
 		return err

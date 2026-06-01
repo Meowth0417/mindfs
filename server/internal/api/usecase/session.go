@@ -1253,6 +1253,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	resolvedModel := resolveRuntimeModel(current, sess, in.Model)
 	resolvedEffort := resolveRuntimeEffort(in.Agent, current, in.Effort)
 	resolvedFastService := resolveRuntimeFastService(in.Agent, current, in.FastService)
+	persistedContextWindow := latestPersistableContextWindow(ctx, sess)
 	if prefs := s.Registry.GetPreferences(); prefs != nil {
 		if changed, err := prefs.UpdateAgentDefaultsIfChanged(in.Agent, resolvedModel, resolvedEffort, resolvedFastService); err != nil {
 			log.Printf("[preferences] agent_defaults.update.error agent=%s err=%v", strings.TrimSpace(in.Agent), err)
@@ -1264,11 +1265,11 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		return err
 	}
 	resolvedMode := resolveRuntimeMode(current, in.Mode)
-	if err := manager.AddExchangeForAgent(ctx, current, "user", in.Content, in.Agent, resolvedMode, resolvedEffort, resolvedFastService); err != nil {
+	if err := manager.AddExchangeForAgent(ctx, current, "user", in.Content, in.Agent, resolvedMode, resolvedEffort, resolvedFastService, nil); err != nil {
 		log.Printf("[session] persist.user.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, err)
 		return err
 	}
-	if err := manager.AddExchangeForAgent(ctx, current, "agent", responseText, in.Agent, resolvedMode, resolvedEffort, resolvedFastService); err != nil {
+	if err := manager.AddExchangeForAgent(ctx, current, "agent", responseText, in.Agent, resolvedMode, resolvedEffort, resolvedFastService, persistedContextWindow); err != nil {
 		log.Printf("[session] persist.agent.error root=%s session=%s agent=%s err=%v", in.RootID, current.Key, in.Agent, err)
 		return err
 	}
@@ -1291,6 +1292,23 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		prober.ReportSuccess(in.Agent)
 	}
 	return nil
+}
+
+func latestPersistableContextWindow(ctx context.Context, sess agenttypes.Session) *agenttypes.ContextWindow {
+	if sess == nil {
+		return nil
+	}
+	contextWindow, err := sess.ContextWindow(ctx)
+	if err != nil {
+		return nil
+	}
+	if contextWindow.TotalTokens <= 0 || contextWindow.ModelContextWindow <= 0 {
+		return nil
+	}
+	return &agenttypes.ContextWindow{
+		TotalTokens:        contextWindow.TotalTokens,
+		ModelContextWindow: contextWindow.ModelContextWindow,
+	}
 }
 
 type SendRecoveryInput struct {

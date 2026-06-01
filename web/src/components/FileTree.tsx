@@ -67,6 +67,7 @@ type FileTreeProps = {
   onCreateRootNameChange?: (name: string) => void;
   onCreateRootSubmit?: () => void;
   onCreateRootCancel?: () => void;
+  onCollapseAll?: () => void;
   projectAddOverlay?: React.ReactNode;
   relayActionLabel?: string | null;
   relayActionDisabled?: boolean;
@@ -160,6 +161,7 @@ export function FileTree({
   onCreateRootNameChange,
   onCreateRootSubmit,
   onCreateRootCancel,
+  onCollapseAll,
   projectAddOverlay,
   relayActionLabel = null,
   relayActionDisabled = false,
@@ -795,17 +797,18 @@ export function FileTree({
     <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
       <div style={{ position: "relative", height: "36px", padding: "0 3px 0 16px", borderBottom: "1px solid var(--border-color)", display: "flex", justifyContent: "space-between", alignItems: "center", background: "var(--mindfs-topbar-bg, transparent)", boxSizing: "border-box", flexShrink: 0, gap: 12, overflow: "visible" }}>
         <h3 style={{ margin: 0, fontSize: "11px", fontWeight: 600, color: "var(--text-secondary)", letterSpacing: "0.5px", textTransform: "uppercase" }}>Project</h3>
-        <div ref={menuRef} style={{ position: "relative" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
           <button
             type="button"
-            onClick={() => setIsMenuOpen((open) => !open)}
-            aria-label="打开文件树菜单"
+            onClick={() => onCollapseAll?.()}
+            aria-label="折叠全部"
+            title="折叠全部"
             style={{
               width: "28px",
               height: "28px",
               borderRadius: "8px",
               border: "none",
-              background: isMenuOpen ? "rgba(0, 0, 0, 0.06)" : "transparent",
+              background: "transparent",
               color: "var(--text-secondary)",
               display: "inline-flex",
               alignItems: "center",
@@ -814,27 +817,64 @@ export function FileTree({
               outline: "none",
             }}
           >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-              <circle cx="12" cy="5" r="1.8" />
-              <circle cx="12" cy="12" r="1.8" />
-              <circle cx="12" cy="19" r="1.8" />
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path
+                d="M7 10 12 15 17 10"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+              <path
+                d="M7 6 12 11 17 6"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                opacity="0.72"
+              />
             </svg>
           </button>
-          {isMenuOpen ? (
-            <div
+          <div ref={menuRef} style={{ position: "relative" }}>
+            <button
+              type="button"
+              onClick={() => setIsMenuOpen((open) => !open)}
+              aria-label="打开文件树菜单"
               style={{
-                position: "absolute",
-                top: "calc(100% + 6px)",
-                right: 0,
-                minWidth: "164px",
-                padding: "6px",
-                borderRadius: "10px",
-                border: "1px solid var(--border-color)",
-                background: "var(--menu-bg)",
-                boxShadow: "0 12px 30px rgba(15, 23, 42, 0.14)",
-                zIndex: 20,
+                width: "28px",
+                height: "28px",
+                borderRadius: "8px",
+                border: "none",
+                background: isMenuOpen ? "rgba(0, 0, 0, 0.06)" : "transparent",
+                color: "var(--text-secondary)",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                cursor: "pointer",
+                outline: "none",
               }}
             >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <circle cx="12" cy="5" r="1.8" />
+                <circle cx="12" cy="12" r="1.8" />
+                <circle cx="12" cy="19" r="1.8" />
+              </svg>
+            </button>
+            {isMenuOpen ? (
+              <div
+                style={{
+                  position: "absolute",
+                  top: "calc(100% + 6px)",
+                  right: 0,
+                  minWidth: "164px",
+                  padding: "6px",
+                  borderRadius: "10px",
+                  border: "1px solid var(--border-color)",
+                  background: "var(--menu-bg)",
+                  boxShadow: "0 12px 30px rgba(15, 23, 42, 0.14)",
+                  zIndex: 20,
+                }}
+              >
                 <button
                   type="button"
                   onClick={() => {
@@ -920,20 +960,21 @@ export function FileTree({
                 <span>显示隐藏文件</span>
                 <span style={{ fontSize: "11px", opacity: showHiddenFiles ? 1 : 0 }}>✓</span>
               </button>
-            </div>
-          ) : null}
-          {projectAddOverlay ? (
-            <div
-              style={{
-                position: "absolute",
-                top: "calc(100% + 6px)",
-                right: 0,
-                zIndex: 30,
-              }}
-            >
-              {projectAddOverlay}
-            </div>
-          ) : null}
+              </div>
+            ) : null}
+            {projectAddOverlay ? (
+              <div
+                style={{
+                  position: "absolute",
+                  top: "calc(100% + 6px)",
+                  right: 0,
+                  zIndex: 30,
+                }}
+              >
+                {projectAddOverlay}
+              </div>
+            ) : null}
+          </div>
         </div>
       </div>
       <div style={{ padding: "8px", flex: 1, minHeight: 0, overflow: "auto" }}>

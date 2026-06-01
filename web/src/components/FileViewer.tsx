@@ -38,6 +38,7 @@ type RelatedSession = {
 
 type FileViewerProps = {
   file?: FilePayload | null;
+  headerAction?: React.ReactNode;
   onSessionClick?: (sessionKey: string) => void;
   onPathClick?: (path: string) => void;
   onFileClick?: (path: string) => void;
@@ -127,7 +128,17 @@ function Breadcrumbs({ root, path, onPathClick }: { root?: string; path: string;
   );
 }
 
-export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onSelectionChange, initialScrollTop = 0, onScrollTopChange, isVisible = true }: FileViewerProps) {
+export function FileViewer({
+  file,
+  headerAction,
+  onSessionClick,
+  onPathClick,
+  onFileClick,
+  onSelectionChange,
+  initialScrollTop = 0,
+  onScrollTopChange,
+  isVisible = true,
+}: FileViewerProps) {
   const [isDownloading, setIsDownloading] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const restoredScrollKeyRef = useRef("");
@@ -431,6 +442,18 @@ export function FileViewer({ file, onSessionClick, onPathClick, onFileClick, onS
               </div>
             </div>
           )}
+            {headerAction ? (
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  marginLeft: "6px",
+                  flexShrink: 0,
+                }}
+              >
+                {headerAction}
+              </div>
+            ) : null}
             <div style={{ fontSize: "11px", color: "var(--text-secondary)", marginLeft: "6px", flexShrink: 0, opacity: 0.7 }}>{(file.size / 1024).toFixed(1)} KB</div>
             <button
               type="button"
